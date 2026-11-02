@@ -1,8 +1,10 @@
 {
 	"name": "@cap/utils",
 	"type": "module",
+	"sideEffects": false,
 	"exports": {
-		".": "./src/index.ts"
+		".": "./src/index.ts",
+		"./helpers": "./src/helpers.ts"
 	},
 	"scripts": {
 		"typecheck": "tsc -b",

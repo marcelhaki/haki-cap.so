@@ -1,6 +1,22 @@
 import { checkRateLimit } from "@vercel/firewall";
 import { headers as nextHeaders } from "next/headers";
 
+const FIREWALL_FORWARDED_HEADER_NAMES = [
+	"host",
+	"x-real-ip",
+	"x-forwarded-for",
+	"x-vercel-id",
+] as const;
+
+export function firewallRequestHeaders(source: Headers): Headers {
+	const headers = new Headers();
+	for (const name of FIREWALL_FORWARDED_HEADER_NAMES) {
+		const value = source.get(name);
+		if (value) headers.set(name, value);
+	}
+	return headers;
+}
+
 /**
  * Best-effort per-key rate limiting backed by the Vercel Firewall.
  *
@@ -33,7 +49,9 @@ export async function isRateLimited(
 	if (process.env.NODE_ENV !== "production") return false;
 
 	try {
-		const headersList = opts?.headers ?? (await nextHeaders());
+		const headersList = firewallRequestHeaders(
+			opts?.headers ?? (await nextHeaders()),
+		);
 		const request = new Request("https://cap.so/api/rate-limit", {
 			method: "POST",
 			headers: headersList,
@@ -77,6 +95,8 @@ export const RATE_LIMIT_IDS = {
 	GUEST_CHECKOUT: "rl_guest_checkout",
 	/** Unauthed desktop log → Discord forwarding (spam). Suggested: 10 / 1m per IP. */
 	DESKTOP_LOGS: "rl_desktop_logs",
+	/** Mobile share password attempts (brute-force guard). Suggested: 10 / 10m per key (user). */
+	MOBILE_VIDEO_PASSWORD: "rl_mobile_video_password",
 	/** Unauthed docs Ask AI questions (Anthropic cost). Suggested: 10 / 1m per IP. */
 	DOCS_ASK: "rl_docs_ask",
 } as const;

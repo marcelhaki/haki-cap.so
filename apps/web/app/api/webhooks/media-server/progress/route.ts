@@ -3,16 +3,33 @@ import { db } from "@cap/database";
 import { videos, videoUploads } from "@cap/database/schema";
 import { serverEnv } from "@cap/env";
 import type { Video } from "@cap/web-domain";
-import { eq } from "drizzle-orm";
+import { and, eq, isNull, ne, or, sql } from "drizzle-orm";
 import { type NextRequest, NextResponse } from "next/server";
+import { handleAudioLevelPublication } from "@/lib/audio-level-publication";
+import { SourceCommitPendingError } from "@/lib/desktop-recording-jobs";
+import { applyDesktopRecordingProgress } from "@/lib/desktop-recording-publication";
+import { createVerifiedRecordingReceipt } from "@/lib/desktop-recording-upload-status";
+import {
+	type RecordingVerification,
+	recordingVerificationSchema,
+} from "@/lib/desktop-recording-verification";
+import { queueDesktopSegmentsFinalization } from "@/lib/desktop-segments-finalization";
 import { invalidateGoogleDriveStorageQuotaCache } from "@/lib/google-drive-storage-quota";
+import { signalLoomImportFinished } from "@/lib/loom-import-signal";
 import {
 	queueVideoTranscription,
 	shouldQueueTranscriptionAfterMediaComplete,
 } from "@/lib/queue-video-transcription";
 import { isEditSourceKey } from "@/lib/video-edit-processing";
+import { applyEditProgress } from "@/lib/video-edit-progress";
 
 interface ProgressWebhookPayload {
+	manifestSha256?: string;
+	recordingVerification?: {
+		request: RecordingVerification;
+		fullDecode: boolean;
+		objectIdentity?: string;
+	};
 	jobId: string;
 	videoId: string;
 	phase:
@@ -40,7 +57,10 @@ interface ProgressWebhookPayload {
 		bitrate: number;
 		fileSize: number;
 	};
+	deferredSourceKey?: string;
 }
+
+const MEDIA_SERVER_SHUTDOWN_MESSAGE = "Server shutting down";
 
 function getValidDuration(duration: number) {
 	return Number.isFinite(duration) && duration > 0 ? duration : undefined;
@@ -86,10 +106,53 @@ export async function POST(request: NextRequest) {
 			return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 		}
 
-		const payload: ProgressWebhookPayload = await request.json();
+		const body: unknown = await request.json();
+		if (
+			body &&
+			typeof body === "object" &&
+			"kind" in body &&
+			body.kind === "audio-levels"
+		)
+			return NextResponse.json(await handleAudioLevelPublication(body));
+		const payload = body as ProgressWebhookPayload;
+		if (
+			await applyEditProgress(
+				payload,
+				request.nextUrl.searchParams.get("editOperation"),
+				request.nextUrl.searchParams.get("editStartedAt"),
+			)
+		) {
+			return NextResponse.json({ success: true });
+		}
+		const recordingProgress = await applyDesktopRecordingProgress(payload);
+		if (recordingProgress.handled) {
+			if (recordingProgress.published) {
+				try {
+					await queueVideoTranscription(payload.videoId as Video.VideoId);
+				} catch {
+					console.warn(
+						"[media-server-webhook] Transcription queue unavailable",
+						{
+							videoId: payload.videoId,
+						},
+					);
+				}
+			}
+			return NextResponse.json(
+				{
+					success: recordingProgress.status === 200,
+					...(recordingProgress.recordingWorker
+						? { recordingWorker: recordingProgress.recordingWorker }
+						: {}),
+				},
+				{ status: recordingProgress.status ?? 200 },
+			);
+		}
 		const isRetryableWorkflowError =
 			request.nextUrl.searchParams.get("retryable") === "true" &&
-			payload.phase === "error";
+			(payload.phase === "error" ||
+				(payload.phase === "cancelled" &&
+					payload.message === MEDIA_SERVER_SHUTDOWN_MESSAGE));
 
 		console.log(
 			"[media-server-webhook] Received progress update for video %s: %s (%d%%)",
@@ -101,6 +164,63 @@ export async function POST(request: NextRequest) {
 		const dbPhase = mapPhaseToDbPhase(payload.phase);
 
 		if (dbPhase === "complete") {
+			const [currentVideo] = await db()
+				.select()
+				.from(videos)
+				.where(eq(videos.id, payload.videoId as Video.VideoId));
+			const [currentUpload] = await db()
+				.select({ rawFileKey: videoUploads.rawFileKey })
+				.from(videoUploads)
+				.where(eq(videoUploads.videoId, payload.videoId as Video.VideoId));
+			const isEditUpload =
+				currentVideo &&
+				isEditSourceKey({
+					ownerId: currentVideo.ownerId,
+					videoId: payload.videoId,
+					rawFileKey: currentUpload?.rawFileKey,
+				});
+			const proof = payload.recordingVerification;
+			if (
+				!isEditUpload &&
+				!recordingProgress.allowLegacyProcessing &&
+				(currentVideo?.source.type === "desktopSegments" ||
+					currentVideo?.source.type === "desktopMP4")
+			) {
+				try {
+					await queueDesktopSegmentsFinalization({
+						videoId: currentVideo.id,
+						userId: currentVideo.ownerId,
+						verification: proof
+							? recordingVerificationSchema.parse(proof.request)
+							: undefined,
+					});
+				} catch (error) {
+					if (!(error instanceof SourceCommitPendingError)) throw error;
+				}
+				return NextResponse.json({
+					success: true,
+					status: "queued-for-verification",
+				});
+			}
+			const receipt = proof
+				? currentVideo && payload.metadata
+					? await createVerifiedRecordingReceipt(
+							currentVideo,
+							recordingVerificationSchema.parse(proof.request),
+							payload.metadata,
+							proof.fullDecode,
+							proof.objectIdentity,
+						)
+					: null
+				: undefined;
+			if (receipt === null) {
+				return NextResponse.json(
+					{
+						error: "Recording completion is missing required verification data",
+					},
+					{ status: 503 },
+				);
+			}
 			if (payload.metadata) {
 				const duration = getValidDuration(payload.metadata.duration);
 				await db()
@@ -114,29 +234,61 @@ export async function POST(request: NextRequest) {
 					.where(eq(videos.id, payload.videoId as Video.VideoId));
 			}
 
-			const [currentVideo] = await db()
-				.select()
-				.from(videos)
-				.where(eq(videos.id, payload.videoId as Video.VideoId));
-			const [currentUpload] = await db()
-				.select({ rawFileKey: videoUploads.rawFileKey })
-				.from(videoUploads)
-				.where(eq(videoUploads.videoId, payload.videoId as Video.VideoId));
-
-			if (currentVideo?.source?.type === "desktopSegments") {
+			const transcribeOnView =
+				request.nextUrl.searchParams.get("transcription") === "on-view";
+			const previewOnView =
+				request.nextUrl.searchParams.get("preview") === "on-view";
+			const deferredSourceKey =
+				currentVideo &&
+				typeof payload.deferredSourceKey === "string" &&
+				payload.deferredSourceKey.startsWith(
+					`${currentVideo.ownerId}/${currentVideo.id}/`,
+				) &&
+				payload.deferredSourceKey.endsWith(".webm")
+					? payload.deferredSourceKey
+					: undefined;
+			const metadataUpdates = [
+				...(transcribeOnView
+					? [sql`'$.transcribeOnView', JSON_EXTRACT('true', '$')`]
+					: []),
+				...(previewOnView && !payload.deferredSourceKey
+					? [
+							sql`'$.loomPreviewGif', COALESCE(JSON_EXTRACT(${videos.metadata}, '$.loomPreviewGif'), JSON_OBJECT('status', 'pending'))`,
+						]
+					: []),
+				...(currentVideo?.metadata?.loomDeferredProcessing &&
+				currentUpload?.rawFileKey ===
+					currentVideo.metadata.loomDeferredProcessing.rawFileKey
+					? [sql`'$.loomDeferredProcessing.status', 'complete'`]
+					: []),
+				...(deferredSourceKey
+					? [
+							sql`'$.loomDeferredProcessing', IF(JSON_EXTRACT(${videos.metadata}, '$.loomDeferredProcessing') IS NULL, JSON_OBJECT('rawFileKey', ${deferredSourceKey}, 'status', 'pending'), JSON_EXTRACT(${videos.metadata}, '$.loomDeferredProcessing'))`,
+						]
+					: []),
+			];
+			if (currentVideo && metadataUpdates.length > 0) {
 				await db()
 					.update(videos)
-					.set({ source: { type: "desktopMP4" as const } })
-					.where(eq(videos.id, payload.videoId as Video.VideoId));
+					.set({
+						metadata: sql`JSON_SET(COALESCE(${videos.metadata}, JSON_OBJECT()), ${sql.join(metadataUpdates, sql`, `)})`,
+					})
+					.where(eq(videos.id, currentVideo.id));
 			}
 
-			const isEditUpload =
-				currentVideo &&
-				isEditSourceKey({
-					ownerId: currentVideo.ownerId,
-					videoId: payload.videoId,
-					rawFileKey: currentUpload?.rawFileKey,
-				});
+			if (receipt) {
+				await db()
+					.update(videos)
+					.set({
+						source: { type: "desktopMP4" as const },
+						...(receipt
+							? {
+									metadata: sql`JSON_SET(COALESCE(${videos.metadata}, JSON_OBJECT()), '$.desktopRecordingUpload', JSON_OBJECT('version', ${receipt.version}, 'artifact', JSON_EXTRACT(${JSON.stringify(receipt.artifact)}, '$'), 'fileSize', ${receipt.fileSize}, 'duration', ${receipt.duration}, 'hasAudio', JSON_EXTRACT(${JSON.stringify(receipt.hasAudio)}, '$'), 'fullDecode', JSON_EXTRACT('true', '$'), 'requiredAudioVerified', JSON_EXTRACT(${JSON.stringify(receipt.requiredAudioVerified)}, '$'), 'objectIdentity', ${receipt.objectIdentity}))`,
+								}
+							: {}),
+					})
+					.where(eq(videos.id, payload.videoId as Video.VideoId));
+			}
 
 			if (isEditUpload) {
 				await db()
@@ -152,13 +304,24 @@ export async function POST(request: NextRequest) {
 			} else {
 				await db()
 					.delete(videoUploads)
-					.where(eq(videoUploads.videoId, payload.videoId as Video.VideoId));
+					.where(
+						and(
+							eq(videoUploads.videoId, payload.videoId as Video.VideoId),
+							deferredSourceKey
+								? or(
+										isNull(videoUploads.rawFileKey),
+										ne(videoUploads.rawFileKey, deferredSourceKey),
+									)
+								: undefined,
+						),
+					);
 			}
 			await invalidateGoogleDriveStorageQuotaCache(
 				currentVideo?.storageIntegrationId,
 			);
 
 			if (
+				!transcribeOnView &&
 				shouldQueueTranscriptionAfterMediaComplete(
 					currentVideo?.source.type,
 					Boolean(isEditUpload),
@@ -218,6 +381,13 @@ export async function POST(request: NextRequest) {
 				})
 				.where(eq(videoUploads.videoId, payload.videoId as Video.VideoId));
 		}
+
+		if (dbPhase === "complete" || dbPhase === "error")
+			await signalLoomImportFinished(
+				request.nextUrl.searchParams.get("signal"),
+				payload.videoId,
+				payload.phase,
+			);
 
 		return NextResponse.json({ success: true });
 	} catch (error) {

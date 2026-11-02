@@ -267,7 +267,7 @@ impl DisplayImpl {
 
 fn get_cursor_position() -> Option<LogicalPosition> {
     let event_source = core_graphics::event_source::CGEventSource::new(
-        core_graphics::event_source::CGEventSourceStateID::Private,
+        core_graphics::event_source::CGEventSourceStateID::CombinedSessionState,
     )
     .ok()?;
 
@@ -347,6 +347,12 @@ impl WindowImpl {
         windows_with_level.sort_by_key(|b| std::cmp::Reverse(b.1));
 
         windows_with_level.first().map(|(window, _)| *window)
+    }
+
+    /// The window `id`, without enumerating every window. Whether it still
+    /// exists shows in what its getters return.
+    pub fn from_id_direct(id: &WindowIdImpl) -> Option<Self> {
+        Some(Self(id.0))
     }
 
     pub fn id(&self) -> WindowIdImpl {
@@ -510,7 +516,7 @@ impl WindowImpl {
 
     pub fn app_icon(&self) -> Option<Vec<u8>> {
         use cocoa::base::{id, nil};
-        use cocoa::foundation::{NSArray, NSAutoreleasePool, NSString};
+        use cocoa::foundation::{NSArray, NSAutoreleasePool, NSPoint, NSRect, NSSize, NSString};
         use objc::{class, msg_send, sel, sel_impl};
 
         let owner_name = self.owner_name()?;
@@ -549,16 +555,24 @@ impl WindowImpl {
                     return None;
                 }
 
-                let tiff_data: id = msg_send![icon, TIFFRepresentation];
-                if tiff_data.is_null() {
+                let mut bounds = NSRect::new(NSPoint::new(0., 0.), NSSize::new(128., 128.));
+                let image: *mut std::ffi::c_void = msg_send![
+                    icon,
+                    CGImageForProposedRect: &mut bounds
+                    context: nil
+                    hints: nil
+                ];
+                if image.is_null() {
                     return None;
                 }
 
                 let bitmap_rep_class = class!(NSBitmapImageRep);
-                let bitmap_rep: id = msg_send![bitmap_rep_class, imageRepWithData: tiff_data];
+                let bitmap_rep: id = msg_send![bitmap_rep_class, alloc];
+                let bitmap_rep: id = msg_send![bitmap_rep, initWithCGImage: image];
                 if bitmap_rep.is_null() {
                     return None;
                 }
+                let bitmap_rep: id = msg_send![bitmap_rep, autorelease];
 
                 let png_data: id = msg_send![
                     bitmap_rep,

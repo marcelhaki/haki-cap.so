@@ -17,7 +17,7 @@ export const hipaaCompliantScreenRecordingContent: SeoPageContent = {
 		{
 			title: "HIPAA Compliant with Signed BAAs",
 			description:
-				"Cap is fully HIPAA compliant. We sign Business Associate Agreements with healthcare organizations, and every vendor in Cap's production infrastructure, from cloud storage to transcription, is covered by a BAA. Combined with SOC 2 Type II and ISO 27001, Cap Cloud is ready for PHI out of the box.",
+				"Cap is fully HIPAA compliant. Any organization on the Cap Pro plan can execute a Business Associate Agreement in minutes, directly from the dashboard, with no enterprise tier required. Every vendor in Cap's production infrastructure, from cloud storage to transcription, is covered by a BAA. Combined with SOC 2 Type II and ISO 27001, Cap Cloud is ready for PHI out of the box.",
 		},
 		{
 			title: "Self-Hosted Storage — PHI Never Leaves Your Infrastructure",
@@ -27,7 +27,7 @@ export const hipaaCompliantScreenRecordingContent: SeoPageContent = {
 		{
 			title: "Open-Source and Auditable",
 			description:
-				"Cap is MIT-licensed and fully open source on GitHub. Your security and compliance teams can audit every line of code. No black-box behavior, no undisclosed data collection — full transparency for your compliance reviews and vendor assessments.",
+				"Cap is open source on GitHub, with most code under AGPLv3 and specified Rust crates under MIT. Your security and compliance teams can audit every line of code. No black-box behavior, no undisclosed data collection — full transparency for your compliance reviews and vendor assessments.",
 		},
 		{
 			title: "Access-Controlled Sharing",
@@ -107,7 +107,7 @@ export const hipaaCompliantScreenRecordingContent: SeoPageContent = {
 			],
 			[
 				"Open-source code",
-				{ text: "Yes — MIT", status: "positive" },
+				{ text: "Yes — AGPLv3 and MIT crates", status: "positive" },
 				{ text: "No", status: "negative" },
 				{ text: "No", status: "negative" },
 				{ text: "No", status: "negative" },
@@ -224,7 +224,7 @@ export const hipaaCompliantScreenRecordingContent: SeoPageContent = {
 	migrationGuide: {
 		title: "How to Set Up HIPAA-Compliant Screen Recording with Cap",
 		steps: [
-			"Fastest path: use Cap Cloud under a signed BAA. Contact the Cap team via cap.so/support to get your BAA executed, then record and share as normal",
+			"Fastest path: use Cap Cloud under a signed BAA. On the Cap Pro plan, execute your BAA directly from your organization's settings in the dashboard: sign, receive your countersigned copy instantly, then record and share as normal",
 			"Prefer self-hosted storage? Create a HIPAA-eligible AWS S3 bucket in your AWS account — ensure your AWS account is covered by an AWS BAA",
 			"Configure Cap's storage settings to point to your AWS S3 bucket using your AWS access key and secret",
 			"Download Cap for Mac or Windows — installation takes under 2 minutes",
@@ -241,7 +241,12 @@ export const hipaaCompliantScreenRecordingContent: SeoPageContent = {
 		{
 			question: "Can Cap be used for HIPAA-compliant screen recording?",
 			answer:
-				"Yes. Cap is HIPAA compliant. We sign Business Associate Agreements (BAAs) with healthcare organizations, and every vendor in Cap's production infrastructure is covered by a BAA. For teams that want additional control, Cap also supports self-hosted storage: connect your own AWS S3 bucket (covered under your AWS BAA) and all recorded video files are stored on your infrastructure rather than Cap's servers.",
+				"Yes. Cap is HIPAA compliant. We sign Business Associate Agreements (BAAs) with healthcare organizations, and every vendor in Cap's production infrastructure is covered by a BAA. Any organization on the Cap Pro plan can execute a BAA in minutes, directly from the dashboard. For teams that want additional control, Cap also supports self-hosted storage: connect your own AWS S3 bucket (covered under your AWS BAA) and all recorded video files are stored on your infrastructure rather than Cap's servers.",
+		},
+		{
+			question: "How do I sign a BAA with Cap?",
+			answer:
+				"Directly from the Cap dashboard. Go to your organization's settings, open the Signed BAA card, enter your legal entity details, and sign. Your countersigned PDF is emailed to you instantly. The BAA is available to every organization on the Cap Pro plan, with no enterprise tier or sales process required.",
 		},
 		{
 			question: "Does Cap store recordings on its own servers?",
@@ -252,7 +257,7 @@ export const hipaaCompliantScreenRecordingContent: SeoPageContent = {
 			question:
 				"Is Cap open source and auditable for HIPAA vendor assessments?",
 			answer:
-				"Yes. Cap is MIT-licensed and fully open source on GitHub. Your security and compliance teams can audit the complete source code to verify data handling behavior, network calls, and storage logic. This transparency simplifies HIPAA vendor security reviews compared to closed-source recording tools.",
+				"Yes. Cap is open source on GitHub, with most code under AGPLv3 and specified Rust crates under MIT. Your security and compliance teams can audit the complete source code to verify data handling behavior, network calls, and storage logic. This transparency simplifies HIPAA vendor security reviews compared to closed-source recording tools.",
 		},
 		{
 			question: "Can I disable AI transcription in Cap for HIPAA compliance?",

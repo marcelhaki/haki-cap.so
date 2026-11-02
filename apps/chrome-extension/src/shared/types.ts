@@ -159,6 +159,9 @@ export type RecordingStatus =
 	  }
 	| {
 			phase: "creating";
+			// Set while the recorder waits on the browser's screen-share picker,
+			// which script cannot dismiss.
+			capturePending?: boolean;
 	  }
 	| {
 			phase: "recording" | "paused" | "uploading";
@@ -166,6 +169,9 @@ export type RecordingStatus =
 			startedAt: number;
 			durationMs: number;
 			updatedAt: number;
+			// Set only when this recording captures a microphone, so the dock
+			// mutes the live track instead of the saved settings.
+			microphone?: "live" | "muted";
 			uploadStatus?: UploadStatus;
 			upload?: UploadSummary;
 	  }
@@ -296,7 +302,12 @@ export type OffscreenRequest =
 	| AcknowledgeErrorRequest
 	| RetryUploadRequest
 	| EnumerateDevicesRequest
-	| ProbeMicrophoneRequest;
+	| ProbeMicrophoneRequest
+	| {
+			target: "offscreen";
+			type: "toggle-microphone-mute";
+			muted: boolean;
+	  };
 
 export type OffscreenResponse =
 	| {
@@ -359,6 +370,10 @@ export type ServiceWorkerRequest =
 	  }
 	| {
 			target: "service-worker";
+			type: "cancel-recording-start";
+	  }
+	| {
+			target: "service-worker";
 			type: "pause-recording";
 	  }
 	| {
@@ -372,6 +387,10 @@ export type ServiceWorkerRequest =
 	| {
 			target: "service-worker";
 			type: "open-recorder-panel";
+	  }
+	| {
+			target: "service-worker";
+			type: "show-recorder-panel";
 	  }
 	| {
 			target: "service-worker";
@@ -393,6 +412,11 @@ export type ServiceWorkerRequest =
 	| {
 			target: "service-worker";
 			type: "close-webcam-preview";
+	  }
+	| {
+			target: "service-worker";
+			type: "toggle-microphone-mute";
+			muted: boolean;
 	  }
 	| {
 			target: "service-worker";

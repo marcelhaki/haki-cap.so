@@ -1,5 +1,5 @@
 //! Runs Cap automation rules from the CLI, sharing the exact rule model and engine the desktop app
-//! uses (`cap_automation`). Rules are authored in Cap Desktop and persisted to its tauri-plugin-store
+//! uses (`cap_automation`). Rules are authored in Cap Desktop and persisted to its JSON store
 //! file; the CLI reads that file directly (same approach as `credentials.rs`) so a rule like
 //! "on screenshot, save to ~/Shots" is honored whether the capture came from the app or `cap`.
 
@@ -211,6 +211,13 @@ impl AutomationHost for CliAutomationHost {
         Ok(())
     }
 
+    fn upload_is_verified(
+        &self,
+        _ctx: &TriggerContext,
+    ) -> impl std::future::Future<Output = Result<bool, String>> + Send {
+        std::future::ready(Ok(false))
+    }
+
     async fn reveal_in_file_manager(&self, ctx: &TriggerContext) -> Result<(), String> {
         let path = ctx
             .image_path
@@ -359,20 +366,11 @@ impl AutomationHost for CliAutomationHost {
             .ok_or_else(|| format!("Preset '{name}' not found"))?;
 
         let config_value = preset.get("config").ok_or("Preset has no config")?;
-        let mut config: cap_project::ProjectConfiguration =
+        let config: cap_project::ProjectConfiguration =
             serde_json::from_value(config_value.clone())
                 .map_err(|e| format!("Failed to parse preset config: {e}"))?;
 
-        if config.timeline.is_none() {
-            config.timeline = cap_project::ProjectConfiguration::load(project_path)
-                .ok()
-                .and_then(|c| c.timeline);
-        }
-
-        config
-            .write(project_path)
-            .map_err(|e| format!("Failed to write project config: {e}"))?;
-        Ok(())
+        apply_project_preset(project_path, config)
     }
 
     async fn delete_local_files(&self, ctx: &TriggerContext) -> Result<(), String> {
@@ -393,6 +391,21 @@ fn map_compression(
         Some(AutomationExportCompression::Web) | None => cap_export::mp4::ExportCompression::Web,
         Some(AutomationExportCompression::Potato) => cap_export::mp4::ExportCompression::Potato,
     }
+}
+
+fn apply_project_preset(
+    project_path: &Path,
+    preset: cap_project::ProjectConfiguration,
+) -> Result<(), String> {
+    let current = match cap_project::ProjectConfiguration::load(project_path) {
+        Ok(current) => current,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Default::default(),
+        Err(error) => return Err(format!("Failed to load project config: {error}")),
+    };
+    current
+        .with_preset(preset)
+        .write(project_path)
+        .map_err(|error| format!("Failed to write project config: {error}"))
 }
 
 fn context_env(ctx: &TriggerContext) -> Vec<(&'static str, String)> {
@@ -560,6 +573,139 @@ pub fn list(format: crate::OutputFormat) -> Result<(), String> {
                 }
             }
             Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cap_automation::{Action, AutomationRule, MatchMode};
+
+    #[test]
+    fn cli_presets_keep_caption_source_and_edits_after_reopening() {
+        let current: cap_project::ProjectConfiguration =
+            serde_json::from_value(serde_json::json!({
+                "timeline": {
+                    "segments": [{ "start": 0.0, "end": 10.0, "timescale": 1.0 }],
+                    "zoomSegments": [],
+                    "captionSegments": [{ "id": "spoken", "start": 2.0, "end": 3.0,
+                        "text": "Current recording", "colorOverride": "#123456" }]
+                },
+                "captions": {
+                    "segments": [{ "id": "spoken", "start": 2.0, "end": 3.0,
+                        "text": "Current recording",
+                        "words": [{ "text": "Current recording", "start": 2.0, "end": 3.0 }] }],
+                    "settings": { "enabled": true, "size": 32 },
+                    "sourceTimed": true
+                },
+                "clips": [{ "index": 0, "offsets": { "mic": -0.125 } }]
+            }))
+            .unwrap();
+        let mut legacy = current.clone();
+        let captions = legacy.captions.as_mut().unwrap();
+        captions.segments[0].text = "Other recording".into();
+        captions.segments[0].words[0].text = "Other recording".into();
+        captions.settings.size = 72;
+        legacy.timeline.as_mut().unwrap().segments[0].end = 5.0;
+        legacy.clips.clear();
+        let mut styling = legacy.clone();
+        styling.captions.as_mut().unwrap().segments.clear();
+        styling.timeline = None;
+
+        for preset in [legacy, styling, Default::default()] {
+            let temp = tempfile::tempdir().unwrap();
+            current.write(temp.path()).unwrap();
+            let expected_size = preset.captions.as_ref().map_or_else(
+                || cap_project::CaptionSettings::default().size,
+                |captions| captions.settings.size,
+            );
+            apply_project_preset(temp.path(), preset).unwrap();
+            let mut reopened = cap_project::ProjectConfiguration::load(temp.path()).unwrap();
+            let captions = reopened.captions.as_ref().unwrap();
+            assert_eq!(captions.segments[0].text, "Current recording");
+            assert!(captions.source_timed);
+            assert_eq!(captions.settings.size, expected_size);
+            assert_eq!(reopened.clips.len(), 1);
+            assert_eq!(reopened.clips[0].offsets.mic, -0.125);
+            assert_eq!(reopened.timeline.as_ref().unwrap().segments[0].end, 10.0);
+            cap_project::synchronize_captions(&mut reopened, &[10.0]);
+            let track = &reopened.timeline.as_ref().unwrap().caption_segments[0];
+            assert_eq!(track.text, "Current recording");
+            assert_eq!(track.color_override.as_deref(), Some("#123456"));
+        }
+    }
+
+    #[test]
+    fn cli_presets_apply_to_projects_without_a_saved_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut preset = cap_project::ProjectConfiguration::default();
+        preset.background.padding = 24.0;
+        apply_project_preset(temp.path(), preset).unwrap();
+        let reopened = cap_project::ProjectConfiguration::load(temp.path()).unwrap();
+        assert_eq!(reopened.background.padding, 24.0);
+    }
+
+    #[test]
+    fn cli_presets_leave_unreadable_configs_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("project-config.json");
+        std::fs::write(&path, b"incomplete configuration").unwrap();
+        let error = apply_project_preset(temp.path(), Default::default()).unwrap_err();
+        assert!(error.starts_with("Failed to load project config:"));
+        assert_eq!(std::fs::read(path).unwrap(), b"incomplete configuration");
+    }
+
+    #[tokio::test]
+    async fn cli_upload_cleanup_retains_media_without_a_verified_receipt() {
+        for trigger in [Trigger::UploadCompleted, Trigger::InstantRecordingFinished] {
+            let temp = tempfile::tempdir().unwrap();
+            let project_path = temp.path().join("owned.cap");
+            std::fs::create_dir(&project_path).unwrap();
+            let media = project_path.join("retained-media.mp4");
+            std::fs::write(&media, b"owned recording must survive").unwrap();
+            let mut actions = Vec::new();
+            if trigger == Trigger::InstantRecordingFinished {
+                actions.push(Action::Upload {
+                    organization_id: None,
+                    copy_link: false,
+                    open_in_browser: false,
+                });
+            }
+            actions.push(Action::DeleteLocalFiles);
+            let store = AutomationsStore {
+                version: 1,
+                rules: vec![AutomationRule {
+                    id: "owned-cleanup".to_string(),
+                    name: "Upload cleanup".to_string(),
+                    enabled: true,
+                    trigger,
+                    match_mode: MatchMode::All,
+                    conditions: vec![],
+                    actions,
+                }],
+            };
+            let ctx = TriggerContext::new()
+                .with_project_path(project_path)
+                .with_share_link("https://cap.test/s/owned".to_string())
+                .with_share_id("owned".to_string());
+            let results = cap_automation::run(&CliAutomationHost, &store, &trigger, &ctx).await;
+            let deletion = results[0].action_results.last().unwrap();
+            assert!(!deletion.success);
+            assert!(
+                deletion
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("remote verification is unavailable")
+            );
+            assert_eq!(
+                std::fs::read(&media).unwrap(),
+                b"owned recording must survive"
+            );
+            if trigger == Trigger::InstantRecordingFinished {
+                assert!(results[0].action_results[0].success);
+            }
         }
     }
 }
