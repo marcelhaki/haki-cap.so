@@ -17,12 +17,14 @@ import {
 	parseAiGenerationLanguage,
 	Video,
 } from "@cap/web-domain";
-import { AssemblyAI } from "assemblyai";
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { Either, Option, Schema } from "effect";
 import { FatalError } from "workflow";
 import { start } from "workflow/api";
-import { getAssemblyAITranscriptionOptions } from "@/lib/assemblyai";
+import {
+	createAssemblyAIClient,
+	getAssemblyAITranscriptionOptions,
+} from "@/lib/assemblyai";
 import {
 	ENHANCED_AUDIO_CONTENT_TYPE,
 	ENHANCED_AUDIO_EXTENSION,
@@ -161,6 +163,21 @@ export async function transcribeVideoWorkflow(
 
 		await saveTranscription(videoId, userId, videoData.video, transcription);
 	} catch (error) {
+		if (
+			typeof error === "object" &&
+			error !== null &&
+			"message" in error &&
+			typeof error.message === "string" &&
+			error.message.toLowerCase().includes("no spoken audio")
+		) {
+			await markNoAudio(videoId);
+			await cleanupTempAudio(videoId, userId, videoData.video);
+			return {
+				success: true,
+				message: "Video has no spoken audio - skipped transcription",
+			};
+		}
+
 		await markError(videoId);
 		await cleanupTempAudio(videoId, userId, videoData.video);
 		throw error;
@@ -767,9 +784,7 @@ async function transcribeWithAssemblyAI(
 	}
 
 	const audioBuffer = Buffer.from(await audioResponse.arrayBuffer());
-	const client = new AssemblyAI({
-		apiKey: serverEnv().ASSEMBLY_API_KEY as string,
-	});
+	const client = createAssemblyAIClient();
 
 	const transcript = await client.transcripts.transcribe({
 		audio: audioBuffer,
@@ -782,9 +797,14 @@ async function transcribeWithAssemblyAI(
 	);
 
 	if (transcript.status === "error") {
-		throw new Error(
-			`AssemblyAI transcription failed (id=${transcript.id}, language=${language}): ${transcript.error ?? "Unknown error"}`,
-		);
+		const transcriptError = transcript.error ?? "Unknown error";
+		const message = `AssemblyAI transcription failed (id=${transcript.id}, language=${language}): ${transcriptError}`;
+
+		if (transcriptError.toLowerCase().includes("no spoken audio")) {
+			throw new FatalError(message);
+		}
+
+		throw new Error(message);
 	}
 
 	// One paid pass produces both artifacts: the immutable word transcript (in
@@ -815,9 +835,7 @@ async function transcribeEditTranscriptWithAssemblyAI(
 	}
 
 	const audioBuffer = Buffer.from(await audioResponse.arrayBuffer());
-	const client = new AssemblyAI({
-		apiKey: serverEnv().ASSEMBLY_API_KEY as string,
-	});
+	const client = createAssemblyAIClient();
 	const transcript = await client.transcripts.transcribe({
 		audio: audioBuffer,
 		...getAssemblyAITranscriptionOptions("auto"),

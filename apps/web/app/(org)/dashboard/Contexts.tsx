@@ -6,7 +6,7 @@ import { redirect, usePathname } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { InviteDialog } from "@/app/(org)/dashboard/settings/organization/components/InviteDialog";
 import { useCurrentUser } from "@/app/Layout/AuthContext";
-import { UpgradeModal } from "@/components/UpgradeModal";
+import { LazyUpgradeModal } from "@/components/LazyUpgradeModal";
 import {
 	DashboardContext,
 	type ITheme,
@@ -34,6 +34,7 @@ export function DashboardContexts({
 	initialTheme,
 	initialSidebarCollapsed,
 	referClicked,
+	shareableLinkUsage,
 }: {
 	children: React.ReactNode;
 	organizationData: SharedContext["organizationData"];
@@ -46,6 +47,7 @@ export function DashboardContexts({
 	initialTheme: ITheme;
 	initialSidebarCollapsed: boolean;
 	referClicked: boolean;
+	shareableLinkUsage: SharedContext["shareableLinkUsage"];
 }) {
 	const user = useCurrentUser();
 	if (!user) redirect("/login");
@@ -164,6 +166,7 @@ export function DashboardContexts({
 					isDeveloperSection,
 					developerApps,
 					setDeveloperApps,
+					shareableLinkUsage,
 				}}
 			>
 				{children}
@@ -174,7 +177,7 @@ export function DashboardContexts({
 				/>
 
 				{buildEnv.NEXT_PUBLIC_IS_CAP && (
-					<UpgradeModal
+					<LazyUpgradeModal
 						open={upgradeModalOpen}
 						onOpenChange={setUpgradeModalOpen}
 					/>

@@ -1,19 +1,18 @@
 # Railway's Metal builder rejects the BuildKit frontend directive and cache
 # mounts that apps/web/Dockerfile relies on, so this mirrors it without them.
 # Kept separate from upstream's Dockerfile so rebasing stays conflict-free.
-FROM node:24-alpine AS base
-RUN corepack enable
+FROM oven/bun:1.4.4-alpine AS bun
+
+FROM node:24.22.1-alpine AS base
 
 FROM base AS builder
 WORKDIR /app
+COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 COPY . .
 
-RUN corepack enable pnpm
-# --no-frozen-lockfile, not --frozen-lockfile: Railway's builder resolves the
-# workspace "overrides" setting differently than a local pnpm 10.5.2 does and
-# fails ERR_PNPM_LOCKFILE_CONFIG_MISMATCH. An identical frozen install of this
-# same tree passes locally, so the lockfile itself is consistent.
-RUN pnpm i --no-frozen-lockfile
+# Upstream moved from pnpm to Bun and deleted pnpm-lock.yaml, so bun.lock is
+# the only lockfile. Same install as apps/web/Dockerfile minus its cache mount.
+RUN bun install --frozen-lockfile
 
 # Railway exposes service variables to the build as build args only, so WEB_URL
 # has to be redeclared here. packages/env/build.ts resolves NEXT_PUBLIC_WEB_URL
@@ -31,7 +30,7 @@ ENV NEXT_PUBLIC_WEB_URL=$WEB_URL
 ARG NEXT_PUBLIC_DOCKER_BUILD=true
 ENV NEXT_PUBLIC_DOCKER_BUILD=$NEXT_PUBLIC_DOCKER_BUILD
 
-RUN pnpm run build:web
+RUN bun run build:web
 
 FROM base AS runner
 WORKDIR /app

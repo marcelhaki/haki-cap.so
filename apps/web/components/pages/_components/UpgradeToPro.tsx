@@ -1,6 +1,6 @@
 "use client";
 
-import { Button } from "@cap/ui";
+import { Button } from "@cap/ui/button";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type Rive, useRive } from "@/lib/rive";
 
@@ -31,7 +31,7 @@ const ProRiveArt = ({ onReady }: { onReady: (rive: Rive | null) => void }) => {
 };
 
 const UpgradeToPro = ({
-	text = "Upgrade To Cap Pro",
+	text = "Upgrade to Cap Pro",
 	onClick,
 }: {
 	text?: string;

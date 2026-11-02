@@ -30,7 +30,7 @@ var s_cursor: sampler;
 const MAX_ROTATION_RADIANS: f32 = 0.34906584;
 // Smear length ceiling in sprite-UV (1.0 = one cursor-sprite width). A fast
 // flick travels several sprite widths per frame, and the smear length must
-// track it (Screen Studio semantics); this only bounds pathological
+// track it (length-based semantics); this only bounds pathological
 // teleports. The vertex quad expands by the same vector, so the geometry
 // always contains the full streak.
 const MAX_CURSOR_BLUR_UV: f32 = 4.0;
@@ -103,11 +103,10 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 }
 
 fn sample_cursor(uv: vec2<f32>) -> vec4<f32> {
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) {
-        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
-    }
-
-    return textureSample(t_cursor, s_cursor, uv);
+    // Keep implicit mip derivatives uniform across the sprite boundary.
+    let color = textureSample(t_cursor, s_cursor, uv);
+    let inside = all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0));
+    return select(vec4<f32>(0.0), color, inside);
 }
 
 // Confine the sprite to the display card (screen_bounds is the card's

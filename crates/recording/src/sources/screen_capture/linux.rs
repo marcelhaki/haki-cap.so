@@ -1,3 +1,6 @@
+use super::cadence::FrameCadenceGate;
+use super::linux_dmabuf_import;
+use super::linux_shm::{self, ShmSegment};
 use super::*;
 use crate::feeds::microphone::{self, MicrophoneFeed, MicrophoneFeedLock};
 use crate::ffmpeg::FFmpegVideoFrame;
@@ -11,8 +14,8 @@ use ashpd::desktop::{
     screencast::{CursorMode, Screencast, SourceType, Stream as PortalStream},
 };
 use cap_timestamp::Timestamp;
-use futures::channel::mpsc;
-use kameo::Actor as _;
+use futures::{Stream, StreamExt, channel::mpsc};
+use kameo::{Actor as _, actor::ActorRef};
 use pipewire as pw;
 use pw::{properties::properties, spa};
 use std::{
@@ -26,8 +29,18 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 use x11rb::connection::Connection as _;
-use x11rb::protocol::xproto::{ConnectionExt as _, ImageFormat, ImageOrder};
+use x11rb::protocol::Event;
+use x11rb::protocol::composite::{ConnectionExt as _, Redirect};
+use x11rb::protocol::xproto::{
+    ChangeWindowAttributesAux, ConnectionExt as _, EventMask, ImageFormat, ImageOrder, MapState,
+};
 use x11rb::rust_connection::RustConnection;
+
+#[cfg(test)]
+mod x11_tests;
+
+#[cfg(test)]
+mod system_audio_channel_tests;
 
 #[derive(Debug)]
 pub struct X11Capture;
@@ -54,13 +67,21 @@ pub struct VideoSourceConfig {
     input: LinuxInputConfig,
 }
 
+impl VideoSourceConfig {
+    pub(crate) fn video_info(&self) -> VideoInfo {
+        self.video_info
+    }
+}
+
 enum LinuxInputConfig {
     X11(X11InputConfig),
     Wayland(WaylandInputConfig),
 }
 
-pub(crate) struct X11InputConfig {
+#[doc(hidden)]
+pub struct X11InputConfig {
     pub display_name: String,
+    pub window_id: Option<u32>,
     pub x: i32,
     pub y: i32,
     pub width: u32,
@@ -91,69 +112,63 @@ impl ScreenCaptureConfig<X11Capture> {
     pub async fn to_sources(
         &self,
     ) -> anyhow::Result<(VideoSourceConfig, Option<SystemAudioSourceConfig>)> {
-        let system_audio = if self.system_audio {
-            Some(create_system_audio_source_config().await?)
-        } else {
-            None
-        };
-
-        if prefers_wayland_portal() {
-            match create_wayland_source_config(self).await {
-                Ok((video_info, input)) => {
-                    return Ok((
-                        VideoSourceConfig {
-                            video_info,
-                            input: LinuxInputConfig::Wayland(input),
-                        },
-                        system_audio,
-                    ));
-                }
-                Err(error) if std::env::var_os("DISPLAY").is_some() => {
-                    tracing::warn!(
-                        error = %error,
-                        "Wayland portal capture failed; falling back to X11 capture"
-                    );
-                }
-                Err(error) => return Err(error),
+        let source = if prefers_wayland_portal() {
+            let (video_info, input) = create_wayland_source_config(self).await?;
+            VideoSourceConfig {
+                video_info,
+                input: LinuxInputConfig::Wayland(input),
             }
-        }
+        } else {
+            let display = Display::from_id(&self.config.display)
+                .ok_or_else(|| anyhow!("Display not found"))?;
+            let display_position = display
+                .raw_handle()
+                .physical_position()
+                .ok_or_else(|| anyhow!("Display position unavailable"))?;
+            let display_size = display
+                .physical_size()
+                .ok_or_else(|| anyhow!("Display size unavailable"))?;
 
-        let display =
-            Display::from_id(&self.config.display).ok_or_else(|| anyhow!("Display not found"))?;
-        let display_position = display
-            .raw_handle()
-            .physical_position()
-            .ok_or_else(|| anyhow!("Display position unavailable"))?;
-        let display_size = display
-            .physical_size()
-            .ok_or_else(|| anyhow!("Display size unavailable"))?;
+            let crop = self.config.crop_bounds.map(|crop| {
+                (
+                    crop.position().x(),
+                    crop.position().y(),
+                    crop.size().width(),
+                    crop.size().height(),
+                )
+            });
+            let (x, y, width, height) = x11_capture_rect(
+                display_position.x(),
+                display_position.y(),
+                display_size.width(),
+                display_size.height(),
+                crop,
+            )?;
+            let video_info =
+                if matches!(&self.config.linux_source, LinuxCaptureSource::Window { .. }) {
+                    self.video_info
+                } else {
+                    let output_size = constrain_capture_size(
+                        PhysicalSize::new(f64::from(width), f64::from(height)),
+                        Some((self.video_info.width, self.video_info.height)),
+                    );
+                    VideoInfo {
+                        width: output_size.width() as u32,
+                        height: output_size.height() as u32,
+                        ..self.video_info
+                    }
+                };
 
-        let crop = self.config.crop_bounds.map(|crop| {
-            (
-                crop.position().x(),
-                crop.position().y(),
-                crop.size().width(),
-                crop.size().height(),
-            )
-        });
-        let (x, y, width, height) = x11_capture_rect(
-            display_position.x(),
-            display_position.y(),
-            display_size.width(),
-            display_size.height(),
-            crop,
-        )?;
-        let video_info = VideoInfo {
-            width,
-            height,
-            ..self.video_info
-        };
-
-        Ok((
             VideoSourceConfig {
                 video_info,
                 input: LinuxInputConfig::X11(X11InputConfig {
                     display_name: std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string()),
+                    window_id: match &self.config.linux_source {
+                        LinuxCaptureSource::Window { id } => {
+                            Some(id.to_string().parse().context("Invalid X11 window ID")?)
+                        }
+                        LinuxCaptureSource::Display | LinuxCaptureSource::Area => None,
+                    },
                     x,
                     y,
                     width,
@@ -161,13 +176,19 @@ impl ScreenCaptureConfig<X11Capture> {
                     fps: self.config.fps,
                     show_cursor: self.config.show_cursor,
                 }),
-            },
-            system_audio,
-        ))
+            }
+        };
+        let system_audio = if self.system_audio {
+            Some(create_system_audio_source_config().await?)
+        } else {
+            None
+        };
+
+        Ok((source, system_audio))
     }
 }
 
-pub(crate) fn x11_capture_rect(
+pub fn x11_capture_rect(
     display_x: f64,
     display_y: f64,
     display_width: f64,
@@ -286,6 +307,12 @@ struct PipewireCaptureState {
     fatal_error: Arc<parking_lot::Mutex<Option<String>>>,
     sent: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
+    rate_limited: Arc<AtomicU64>,
+    capture_clock: Instant,
+    cadence_gate: FrameCadenceGate,
+    /// Reads frames with a GPU-tiled modifier; `None` without a usable EGL.
+    importer: Option<linux_dmabuf_import::DmaBufImporter>,
+    imported: Vec<u8>,
 }
 
 impl PipewireCaptureState {
@@ -300,12 +327,33 @@ impl PipewireCaptureState {
 async fn create_wayland_source_config(
     config: &ScreenCaptureConfig<X11Capture>,
 ) -> anyhow::Result<(VideoInfo, WaylandInputConfig)> {
-    let portal = open_wayland_portal(config.config.linux_source, config.config.show_cursor).await?;
-    let crop_bounds = match config.config.linux_source {
+    let portal =
+        open_wayland_portal(&config.config.linux_source, config.config.show_cursor).await?;
+    if matches!(config.config.linux_source, LinuxCaptureSource::Area) {
+        let displays = Display::list();
+        let selected = displays
+            .iter()
+            .find(|display| display.id() == config.config.display)
+            .and_then(|display| display.raw_handle().logical_bounds())
+            .ok_or_else(|| anyhow!("Selected Wayland display is no longer available"))?;
+        if !wayland_area_matches_display(
+            portal.stream.position(),
+            portal.stream.size(),
+            selected,
+            displays.len() == 1,
+        ) {
+            bail!("Select the same display in the screen-sharing dialog as the recording area");
+        }
+    }
+    let crop_bounds = match &config.config.linux_source {
         LinuxCaptureSource::Area => config.config.crop_bounds,
-        LinuxCaptureSource::Display | LinuxCaptureSource::Window => None,
+        LinuxCaptureSource::Display | LinuxCaptureSource::Window { .. } => None,
     };
-    let video_info = wayland_video_info(&portal.stream, config.video_info, crop_bounds);
+    let video_info = wayland_video_info(
+        portal.stream.size(),
+        config.video_info,
+        &config.config.linux_source,
+    );
 
     Ok((
         video_info,
@@ -320,7 +368,7 @@ async fn create_wayland_source_config(
 }
 
 async fn open_wayland_portal(
-    source: LinuxCaptureSource,
+    source: &LinuxCaptureSource,
     show_cursor: bool,
 ) -> anyhow::Result<WaylandPortalCapture> {
     let proxy: Screencast<'static> = Screencast::new()
@@ -374,33 +422,50 @@ async fn open_wayland_portal(
     })
 }
 
-fn prefers_wayland_portal() -> bool {
-    if std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        return false;
-    }
-
-    std::env::var_os("DISPLAY").is_none()
-        || std::env::var("XDG_SESSION_TYPE")
-            .is_ok_and(|session| session.eq_ignore_ascii_case("wayland"))
+pub(crate) fn prefers_wayland_portal() -> bool {
+    prefers_wayland_environment(
+        std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        std::env::var_os("DISPLAY").is_some(),
+        std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
+    )
 }
 
-fn wayland_source_type(source: LinuxCaptureSource) -> ashpd::enumflags2::BitFlags<SourceType> {
+fn prefers_wayland_environment(wayland: bool, x11: bool, session: Option<&str>) -> bool {
+    wayland && (!x11 || session.is_some_and(|session| session.eq_ignore_ascii_case("wayland")))
+}
+
+fn wayland_source_type(source: &LinuxCaptureSource) -> ashpd::enumflags2::BitFlags<SourceType> {
     match source {
-        LinuxCaptureSource::Window => SourceType::Window.into(),
+        LinuxCaptureSource::Window { .. } => SourceType::Window.into(),
         LinuxCaptureSource::Display | LinuxCaptureSource::Area => SourceType::Monitor.into(),
     }
 }
 
+fn wayland_area_matches_display(
+    stream_position: Option<(i32, i32)>,
+    stream_size: Option<(i32, i32)>,
+    selected: LogicalBounds,
+    only_display: bool,
+) -> bool {
+    stream_position.map_or(only_display, |(x, y)| {
+        f64::from(x) == selected.position().x() && f64::from(y) == selected.position().y()
+    }) && stream_size.map_or(only_display, |(width, height)| {
+        f64::from(width) == selected.size().width() && f64::from(height) == selected.size().height()
+    })
+}
+
 fn wayland_video_info(
-    stream: &PortalStream,
+    stream_size: Option<(i32, i32)>,
     fallback: VideoInfo,
-    crop_bounds: Option<CropBounds>,
+    source: &LinuxCaptureSource,
 ) -> VideoInfo {
-    if crop_bounds.is_some() {
+    // Portal sizes use compositor coordinates; configured monitor sizes already
+    // include physical scaling and the requested capture resolution limit.
+    if !matches!(source, LinuxCaptureSource::Window { .. }) {
         return fallback;
     }
 
-    let Some((width, height)) = stream.size() else {
+    let Some((width, height)) = stream_size else {
         return fallback;
     };
     if width <= 0 || height <= 0 {
@@ -422,11 +487,48 @@ fn capture_wayland(
     stop_token: CancellationToken,
     health_tx: output_pipeline::HealthSender,
 ) -> anyhow::Result<()> {
-    let _portal_session = input.portal_session;
+    let WaylandInputConfig {
+        fd,
+        node_id,
+        fps,
+        crop_bounds,
+        portal_session: _portal_session,
+    } = input;
+    capture_pipewire_node(
+        video_info,
+        PipewireNodeInput {
+            fd,
+            node_id,
+            fps,
+            crop_bounds,
+        },
+        video_tx,
+        stop_token,
+        health_tx,
+    )
+}
+
+/// A PipeWire video node to capture: the portal's remote and node, or in
+/// tests any producer on a PipeWire daemon.
+struct PipewireNodeInput {
+    fd: OwnedFd,
+    node_id: u32,
+    fps: u32,
+    crop_bounds: Option<CropBounds>,
+}
+
+fn capture_pipewire_node(
+    video_info: VideoInfo,
+    input: PipewireNodeInput,
+    video_tx: mpsc::Sender<FFmpegVideoFrame>,
+    stop_token: CancellationToken,
+    health_tx: output_pipeline::HealthSender,
+) -> anyhow::Result<()> {
     let stop_requested = Arc::new(AtomicBool::new(false));
     let fatal_error = Arc::new(parking_lot::Mutex::new(None));
     let sent = Arc::new(AtomicU64::new(0));
     let dropped = Arc::new(AtomicU64::new(0));
+    let rate_limited = Arc::new(AtomicU64::new(0));
     let started = Instant::now();
 
     let thread_loop = unsafe { pw::thread_loop::ThreadLoopBox::new(Some("cap-wayland"), None) }
@@ -436,6 +538,18 @@ fn capture_wayland(
     let core = context
         .connect_fd(input.fd, None)
         .context("connect to PipeWire remote")?;
+
+    let mut importer = match linux_dmabuf_import::DmaBufImporter::new() {
+        Ok(importer) => Some(importer),
+        Err(error) => {
+            tracing::info!(%error, "no GPU import for tiled DMA-BUF screencasts");
+            None
+        }
+    };
+    let imported_params = importer
+        .as_mut()
+        .map(|importer| pipewire_imported_format_params(input.fps, importer))
+        .unwrap_or_default();
 
     let state = PipewireCaptureState {
         format: Default::default(),
@@ -448,6 +562,11 @@ fn capture_wayland(
         fatal_error: fatal_error.clone(),
         sent: sent.clone(),
         dropped: dropped.clone(),
+        rate_limited: rate_limited.clone(),
+        capture_clock: started,
+        cadence_gate: FrameCadenceGate::new(1_000_000_000 / i64::from(input.fps.max(1))),
+        importer,
+        imported: Vec::new(),
     };
 
     let stream = pw::stream::StreamBox::new(
@@ -468,9 +587,17 @@ fn capture_wayland(
                 state.set_fatal_error(format!("PipeWire screen capture stream failed: {error}"));
             }
         })
-        .param_changed(|_, state, id, param| {
-            if let Err(error) = update_pipewire_format(state, id, param) {
-                state.set_fatal_error(error.to_string());
+        .param_changed(|stream, state, id, param| {
+            match update_pipewire_format(state, id, param) {
+                Ok(PipewireFormatChange::DmaBuf) => {
+                    // A compositor that only shares DMA-BUFs (niri) still has to
+                    // be told the consumer takes them.
+                    if let Err(error) = request_dmabuf_buffers(stream) {
+                        state.set_fatal_error(error.to_string());
+                    }
+                }
+                Ok(PipewireFormatChange::None | PipewireFormatChange::Memory) => {}
+                Err(error) => state.set_fatal_error(error.to_string()),
             }
         })
         .process(|stream, state| {
@@ -495,9 +622,23 @@ fn capture_wayland(
         .register()
         .context("register PipeWire stream listener")?;
 
-    let param_bytes = pipewire_format_param(input.fps)?;
-    let mut params = [spa::pod::Pod::from_bytes(&param_bytes)
-        .ok_or_else(|| anyhow!("create PipeWire format parameter"))?];
+    // Shared memory first, so compositors that offer it (GNOME, KDE, wlroots)
+    // keep negotiating it; LINEAR DMA-BUFs for those that share nothing else.
+    // Shared memory, then LINEAR DMA-BUFs, both read on the CPU; then the
+    // tiled modifiers a GPU can import, for compositors that cannot render
+    // LINEAR. PipeWire takes the first offer the producer can meet.
+    let mut param_bytes = vec![
+        pipewire_format_param(input.fps)?,
+        pipewire_dmabuf_format_param(input.fps)?,
+    ];
+    param_bytes.extend(imported_params);
+    let mut params = param_bytes
+        .iter()
+        .map(|bytes| {
+            spa::pod::Pod::from_bytes(bytes)
+                .ok_or_else(|| anyhow!("create PipeWire format parameter"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     stream
         .connect(
@@ -524,6 +665,7 @@ fn capture_wayland(
     tracing::info!(
         sent = sent.load(Ordering::Relaxed),
         dropped = dropped.load(Ordering::Relaxed),
+        rate_limited = rate_limited.load(Ordering::Relaxed),
         elapsed_ms = started.elapsed().as_millis() as u64,
         "Linux Wayland PipeWire capture stopped"
     );
@@ -535,16 +677,23 @@ fn capture_wayland(
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum PipewireFormatChange {
+    None,
+    Memory,
+    DmaBuf,
+}
+
 fn update_pipewire_format(
     state: &mut PipewireCaptureState,
     id: u32,
     param: Option<&spa::pod::Pod>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PipewireFormatChange> {
     let Some(param) = param else {
-        return Ok(());
+        return Ok(PipewireFormatChange::None);
     };
     if id != spa::param::ParamType::Format.as_raw() {
-        return Ok(());
+        return Ok(PipewireFormatChange::None);
     }
 
     let (media_type, media_subtype) =
@@ -552,7 +701,7 @@ fn update_pipewire_format(
     if media_type != spa::param::format::MediaType::Video
         || media_subtype != spa::param::format::MediaSubtype::Raw
     {
-        return Ok(());
+        return Ok(PipewireFormatChange::None);
     }
 
     let mut format = spa::param::video::VideoInfoRaw::default();
@@ -567,7 +716,141 @@ fn update_pipewire_format(
     })?;
     state.format = format;
 
-    Ok(())
+    let dmabuf = param.as_object().is_ok_and(|object| {
+        object
+            .find_prop(spa::utils::Id(
+                spa::param::format::FormatProperties::VideoModifier.0,
+            ))
+            .is_some()
+    });
+    if dmabuf {
+        tracing::info!(
+            modifier = format.modifier(),
+            format = ?format.format(),
+            "PipeWire screen capture negotiated DMA-BUF frames"
+        );
+    }
+    Ok(if dmabuf {
+        PipewireFormatChange::DmaBuf
+    } else {
+        PipewireFormatChange::Memory
+    })
+}
+
+fn request_dmabuf_buffers(stream: &pw::stream::Stream) -> anyhow::Result<()> {
+    let dmabuf = 1 << spa::buffer::DataType::DmaBuf.as_raw();
+    let object = spa::pod::object!(
+        spa::utils::SpaTypes::ObjectParamBuffers,
+        spa::param::ParamType::Buffers,
+        spa::pod::Property::new(
+            spa::sys::SPA_PARAM_BUFFERS_dataType,
+            spa::pod::Value::Choice(spa::pod::ChoiceValue::Int(spa::utils::Choice(
+                spa::utils::ChoiceFlags::empty(),
+                spa::utils::ChoiceEnum::Flags {
+                    default: dmabuf,
+                    flags: vec![dmabuf],
+                },
+            ))),
+        )
+    );
+    let bytes = serialize_pod(object, "PipeWire buffers parameter")?;
+    let pod = spa::pod::Pod::from_bytes(&bytes)
+        .ok_or_else(|| anyhow!("create PipeWire buffers parameter"))?;
+    stream
+        .update_params(&mut [pod])
+        .context("ask PipeWire for DMA-BUF screen capture buffers")
+}
+
+/// A DMA-BUF the producer did not map, mapped for reading one frame. LINEAR
+/// buffers are plain rows a CPU can read once the kernel syncs the buffer.
+struct DmaBufMapping {
+    fd: std::os::fd::RawFd,
+    pointer: *mut libc::c_void,
+    len: usize,
+}
+
+const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x4008_6200;
+const DMA_BUF_SYNC_READ: u64 = 1;
+const DMA_BUF_SYNC_END: u64 = 1 << 2;
+
+impl DmaBufMapping {
+    fn map(fd: std::os::fd::RawFd, minimum_len: usize) -> anyhow::Result<Self> {
+        if fd < 0 {
+            bail!("PipeWire screen capture DMA-BUF had no file descriptor");
+        }
+        let size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
+        let len = usize::try_from(size)
+            .ok()
+            .filter(|len| *len > 0)
+            .unwrap_or(minimum_len);
+        if len < minimum_len {
+            bail!(
+                "PipeWire screen capture DMA-BUF holds {len} bytes, the frame needs {minimum_len}"
+            );
+        }
+        let pointer = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if pointer == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error())
+                .context("map the PipeWire screen capture DMA-BUF");
+        }
+        let mapping = Self { fd, pointer, len };
+        mapping
+            .sync(DMA_BUF_SYNC_READ)
+            .context("sync the PipeWire screen capture DMA-BUF for reading")?;
+        Ok(mapping)
+    }
+
+    /// The kernel's DMA-BUF read fence. A buffer that is not a DMA-BUF (a
+    /// memfd standing in for one) has none and answers ENOTTY.
+    fn sync(&self, flags: u64) -> std::io::Result<()> {
+        let sync = flags;
+        loop {
+            let result = unsafe { libc::ioctl(self.fd, DMA_BUF_IOCTL_SYNC, &sync as *const u64) };
+            if result == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            match error.raw_os_error() {
+                Some(libc::EINTR | libc::EAGAIN) => continue,
+                Some(libc::ENOTTY) => return Ok(()),
+                _ => return Err(error),
+            }
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.pointer as *const u8, self.len) }
+    }
+}
+
+impl Drop for DmaBufMapping {
+    fn drop(&mut self) {
+        if let Err(error) = self.sync(DMA_BUF_SYNC_READ | DMA_BUF_SYNC_END) {
+            tracing::warn!(%error, "ending the PipeWire screen capture DMA-BUF read failed");
+        }
+        unsafe {
+            libc::munmap(self.pointer, self.len);
+        }
+    }
+}
+
+fn serialize_pod(object: spa::pod::Object, what: &str) -> anyhow::Result<Vec<u8>> {
+    Ok(spa::pod::serialize::PodSerializer::serialize(
+        std::io::Cursor::new(Vec::new()),
+        &spa::pod::Value::Object(object),
+    )
+    .map_err(|error| anyhow!("serialize {what}: {error:?}"))?
+    .0
+    .into_inner())
 }
 
 fn process_pipewire_frame(
@@ -582,24 +865,41 @@ fn process_pipewire_frame(
         return Ok(None);
     }
 
-    let Some(raw_frame) = frame_from_pipewire_data(&mut datas[0], state.format, state.crop_bounds)?
-    else {
+    let captured_at = Instant::now();
+    let ticks = i64::try_from(
+        captured_at
+            .saturating_duration_since(state.capture_clock)
+            .as_nanos(),
+    )
+    .unwrap_or(i64::MAX);
+    if !state.cadence_gate.admit(ticks) {
+        state.rate_limited.fetch_add(1, Ordering::Relaxed);
+        return Ok(None);
+    }
+
+    let modifier = state.format.modifier();
+    let tiled = datas[0].type_() == spa::buffer::DataType::DmaBuf
+        && modifier != linux_dmabuf_import::DRM_FORMAT_MOD_LINEAR
+        && modifier != linux_dmabuf_import::DRM_FORMAT_MOD_INVALID;
+    let raw_frame = if tiled {
+        let Some(importer) = state.importer.as_mut() else {
+            bail!("PipeWire screen capture sent a tiled DMA-BUF Cap cannot import");
+        };
+        imported_pipewire_frame(
+            &datas[0],
+            state.format,
+            state.crop_bounds,
+            importer,
+            &mut state.imported,
+        )?
+    } else {
+        frame_from_pipewire_data(&mut datas[0], state.format, state.crop_bounds)?
+    };
+    let Some(raw_frame) = raw_frame else {
         return Ok(Some(StallSendOutcome::StalledAndDropped { waited_ms: 0 }));
     };
-    if state.scaler.is_none() {
-        state.scaler = Some(FrameScaler::new(
-            raw_frame.format(),
-            raw_frame.width(),
-            raw_frame.height(),
-            state.video_info,
-        )?);
-    }
-    let frame = state
-        .scaler
-        .as_mut()
-        .expect("PipeWire frame scaler initialized")
-        .scale(&raw_frame, state.video_info)?;
-    let timestamp = Timestamp::Instant(Instant::now());
+    let frame = prepare_pipewire_frame(raw_frame, &mut state.scaler, state.video_info)?;
+    let timestamp = Timestamp::Instant(captured_at);
 
     Ok(Some(send_with_stall_budget_futures(
         &mut state.video_tx,
@@ -610,6 +910,33 @@ fn process_pipewire_frame(
         "linux-wayland-video",
         &state.health_tx,
     )))
+}
+
+fn prepare_pipewire_frame(
+    frame: ffmpeg::frame::Video,
+    scaler: &mut Option<FrameScaler>,
+    output: VideoInfo,
+) -> anyhow::Result<ffmpeg::frame::Video> {
+    if frame.format() == output.pixel_format
+        && frame.width() == output.width
+        && frame.height() == output.height
+    {
+        return Ok(frame);
+    }
+
+    if scaler.is_none() {
+        *scaler = Some(FrameScaler::new(
+            frame.format(),
+            frame.width(),
+            frame.height(),
+            output,
+        )?);
+    }
+
+    scaler
+        .as_mut()
+        .expect("PipeWire frame scaler initialized")
+        .scale(&frame, output)
 }
 
 fn frame_from_pipewire_data(
@@ -650,11 +977,22 @@ fn frame_from_pipewire_data(
     };
     let (crop_x, crop_y, crop_width, crop_height) =
         pipewire_crop(source_width, source_height, crop_bounds)?;
-    let source = data
-        .data()
-        .ok_or_else(|| anyhow!("PipeWire screen capture buffer was not memory-mapped"))?;
     let offset = chunk_offset as usize;
-    let source_limit = if chunk_size > 0 {
+    let dmabuf_fd = (data.type_() == spa::buffer::DataType::DmaBuf).then(|| data.fd() as i32);
+    let mapping;
+    let source: &[u8] = match data.data() {
+        Some(source) => source,
+        None => {
+            let Some(fd) = dmabuf_fd else {
+                bail!("PipeWire screen capture buffer was not memory-mapped");
+            };
+            mapping = DmaBufMapping::map(fd, offset + source_stride * source_height)?;
+            mapping.bytes()
+        }
+    };
+    // DMA-BUF producers may leave the chunk size unset (the PipeWire DMA-BUF
+    // docs tell consumers to ignore it), so the mapping bounds the frame.
+    let source_limit = if chunk_size > 0 && dmabuf_fd.is_none() {
         offset
             .checked_add(chunk_size as usize)
             .map(|limit| limit.min(source.len()))
@@ -692,6 +1030,61 @@ fn frame_from_pipewire_data(
             .copy_from_slice(&source[source_start..source_end]);
     }
 
+    Ok(Some(frame))
+}
+
+/// A frame with a GPU-tiled modifier, read back through EGL as RGBA.
+fn imported_pipewire_frame(
+    data: &spa::buffer::Data,
+    format: spa::param::video::VideoInfoRaw,
+    crop_bounds: Option<CropBounds>,
+    importer: &mut linux_dmabuf_import::DmaBufImporter,
+    scratch: &mut Vec<u8>,
+) -> anyhow::Result<Option<ffmpeg::frame::Video>> {
+    if data
+        .chunk()
+        .flags()
+        .contains(spa::buffer::ChunkFlags::CORRUPTED)
+    {
+        return Ok(None);
+    }
+    let fourcc = linux_dmabuf_import::drm_fourcc(format.format()).ok_or_else(|| {
+        anyhow!(
+            "Unsupported tiled PipeWire screen capture format: {:?}",
+            format.format()
+        )
+    })?;
+    let size = format.size();
+    let (width, height) = (size.width as usize, size.height as usize);
+    if width == 0 || height == 0 {
+        bail!("PipeWire screen capture stream did not provide frame dimensions");
+    }
+    let stride = u32::try_from(data.chunk().stride())
+        .map_err(|_| anyhow!("PipeWire screen capture frame used a negative stride"))?;
+    scratch.resize(width * height * 4, 0);
+    importer.read_rgba(
+        data.fd(),
+        fourcc,
+        format.modifier(),
+        size.width,
+        size.height,
+        data.chunk().offset(),
+        stride,
+        scratch,
+    )?;
+    let (crop_x, crop_y, crop_width, crop_height) = pipewire_crop(width, height, crop_bounds)?;
+    let mut frame = ffmpeg::frame::Video::new(
+        ffmpeg::format::Pixel::RGBA,
+        crop_width as u32,
+        crop_height as u32,
+    );
+    let target_stride = frame.stride(0);
+    let row_bytes = crop_width * 4;
+    for y in 0..crop_height {
+        let source = ((crop_y + y) * width + crop_x) * 4;
+        frame.data_mut(0)[y * target_stride..y * target_stride + row_bytes]
+            .copy_from_slice(&scratch[source..source + row_bytes]);
+    }
     Ok(Some(frame))
 }
 
@@ -817,15 +1210,563 @@ fn pipewire_format_param(fps: u32) -> anyhow::Result<Vec<u8>> {
     .into_inner())
 }
 
+/// The offer for compositors that share only DMA-BUFs with a mandatory
+/// modifier (niri 26.04): LINEAR, so the frames can be read on the CPU.
+fn pipewire_dmabuf_format_param(fps: u32) -> anyhow::Result<Vec<u8>> {
+    use spa::param::video::VideoFormat;
+    pipewire_dmabuf_format_param_for(
+        fps,
+        &[
+            VideoFormat::BGRx,
+            VideoFormat::BGRA,
+            VideoFormat::RGBx,
+            VideoFormat::RGBA,
+        ],
+        &[linux_dmabuf_import::DRM_FORMAT_MOD_LINEAR as i64],
+    )
+}
+
+/// A DMA-BUF offer for `formats` with `modifiers`. More than one modifier
+/// lets the producer choose (DONT_FIXATE), as the PipeWire DMA-BUF protocol
+/// asks.
+fn pipewire_dmabuf_format_param_for(
+    fps: u32,
+    formats: &[spa::param::video::VideoFormat],
+    modifiers: &[i64],
+) -> anyhow::Result<Vec<u8>> {
+    let fps = fps.max(1);
+    let (Some(first_format), Some(first_modifier)) = (formats.first(), modifiers.first()) else {
+        bail!("a DMA-BUF offer needs a format and a modifier");
+    };
+    let mut modifier_flags = spa::pod::PropertyFlags::MANDATORY;
+    if modifiers.len() > 1 {
+        modifier_flags = spa::pod::PropertyFlags::from_bits_retain(
+            modifier_flags.bits() | spa::sys::SPA_POD_PROP_FLAG_DONT_FIXATE,
+        );
+    }
+    let object = spa::pod::object!(
+        spa::utils::SpaTypes::ObjectParamFormat,
+        spa::param::ParamType::EnumFormat,
+        spa::pod::property!(
+            spa::param::format::FormatProperties::MediaType,
+            Id,
+            spa::param::format::MediaType::Video
+        ),
+        spa::pod::property!(
+            spa::param::format::FormatProperties::MediaSubtype,
+            Id,
+            spa::param::format::MediaSubtype::Raw
+        ),
+        spa::pod::Property::new(
+            spa::param::format::FormatProperties::VideoFormat.as_raw(),
+            spa::pod::Value::Choice(spa::pod::ChoiceValue::Id(spa::utils::Choice(
+                spa::utils::ChoiceFlags::empty(),
+                spa::utils::ChoiceEnum::Enum {
+                    default: spa::utils::Id(first_format.as_raw()),
+                    alternatives: formats
+                        .iter()
+                        .map(|format| spa::utils::Id(format.as_raw()))
+                        .collect(),
+                },
+            ))),
+        ),
+        spa::pod::Property {
+            key: spa::param::format::FormatProperties::VideoModifier.as_raw(),
+            flags: modifier_flags,
+            value: spa::pod::Value::Choice(spa::pod::ChoiceValue::Long(spa::utils::Choice(
+                spa::utils::ChoiceFlags::empty(),
+                spa::utils::ChoiceEnum::Enum {
+                    default: *first_modifier,
+                    alternatives: modifiers.to_vec(),
+                },
+            ))),
+        },
+        spa::pod::property!(
+            spa::param::format::FormatProperties::VideoSize,
+            Choice,
+            Range,
+            Rectangle,
+            spa::utils::Rectangle {
+                width: 1920,
+                height: 1080
+            },
+            spa::utils::Rectangle {
+                width: 1,
+                height: 1
+            },
+            spa::utils::Rectangle {
+                width: 8192,
+                height: 8192
+            }
+        ),
+        spa::pod::property!(
+            spa::param::format::FormatProperties::VideoFramerate,
+            Choice,
+            Range,
+            Fraction,
+            spa::utils::Fraction { num: fps, denom: 1 },
+            spa::utils::Fraction { num: 0, denom: 1 },
+            spa::utils::Fraction {
+                num: 1000,
+                denom: 1
+            }
+        )
+    );
+    serialize_pod(object, "PipeWire DMA-BUF format parameter")
+}
+
+/// Offers for the GPU-tiled modifiers this machine can import, one per
+/// format: what a compositor that cannot render LINEAR (niri on NVIDIA)
+/// shares.
+fn pipewire_imported_format_params(
+    fps: u32,
+    importer: &mut linux_dmabuf_import::DmaBufImporter,
+) -> Vec<Vec<u8>> {
+    use spa::param::video::VideoFormat;
+    [VideoFormat::BGRx, VideoFormat::BGRA]
+        .into_iter()
+        .filter_map(|format| {
+            let fourcc = linux_dmabuf_import::drm_fourcc(format)?;
+            let modifiers = importer
+                .modifiers(fourcc)
+                .into_iter()
+                .filter(|modifier| *modifier != linux_dmabuf_import::DRM_FORMAT_MOD_LINEAR)
+                .map(|modifier| modifier as i64)
+                .collect::<Vec<_>>();
+            (!modifiers.is_empty())
+                .then(|| pipewire_dmabuf_format_param_for(fps, &[format], &modifiers).ok())
+                .flatten()
+        })
+        .collect()
+}
+
 pub struct SystemAudioSourceConfig {
     feed_lock: Arc<MicrophoneFeedLock>,
     device_name: String,
-    restore_source: Option<String>,
+    monitor_route: Option<PactlMonitorRoute>,
+    feed: OwnedSystemAudioFeed,
 }
 
 pub struct SystemAudioSource {
     inner: crate::sources::Microphone,
-    restore_source: Option<String>,
+    monitor_route: Option<PactlMonitorRoute>,
+    feed: OwnedSystemAudioFeed,
+}
+
+struct OwnedSystemAudioFeed {
+    actor: ActorRef<MicrophoneFeed>,
+    build_scope: Option<crate::output_pipeline::PipelineBuildScope>,
+    stopped: bool,
+}
+
+impl Drop for OwnedSystemAudioFeed {
+    fn drop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        self.actor.kill();
+        if let Some(scope) = &self.build_scope
+            && !scope.is_committed()
+        {
+            let feed = self.actor.clone();
+            scope.spawn_cleanup(async move {
+                feed.wait_for_stop().await;
+                Ok(())
+            });
+        }
+    }
+}
+
+impl Drop for SystemAudioSource {
+    fn drop(&mut self) {
+        drop(self.monitor_route.take());
+    }
+}
+
+struct PactlMonitorRoute {
+    monitor_source: String,
+    monitor_source_index: u32,
+    default_source: Option<String>,
+    default_source_index: Option<u32>,
+    source_output: u32,
+    original_source: u32,
+    previous_process_source_outputs: Vec<PactlSourceOutput>,
+}
+
+impl Drop for PactlMonitorRoute {
+    fn drop(&mut self) {
+        let restore = || -> anyhow::Result<()> {
+            let outputs = current_process_source_outputs()?;
+            let Some(output) = outputs
+                .iter()
+                .find(|output| output.id == self.source_output)
+            else {
+                return Ok(());
+            };
+            if output.source != self.monitor_source_index {
+                return Ok(());
+            }
+            let destination = previous_source_destination(
+                self.original_source,
+                self.monitor_source_index,
+                &self.monitor_source,
+                self.default_source.as_deref(),
+            );
+            if destination != self.monitor_source_index.to_string() {
+                move_pactl_source_output(self.source_output, &destination)?;
+            }
+            Ok(())
+        };
+        if let Err(error) = restore() {
+            tracing::warn!(%error, "Could not restore the Linux system-audio input route");
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PulseInputRole {
+    #[default]
+    Microphone,
+    SystemAudio,
+}
+
+mod alsa_input_backend {
+    use anyhow::{Context as _, anyhow, bail, ensure};
+    use std::ffi::{CStr, CString, c_char, c_int, c_void};
+
+    #[link(name = "asound")]
+    unsafe extern "C" {
+        fn snd_config_update_ref(config: *mut *mut c_void) -> c_int;
+        fn snd_config_unref(config: *mut c_void);
+        fn snd_config_delete(config: *mut c_void) -> c_int;
+        fn snd_config_search_definition(
+            config: *mut c_void,
+            base: *const c_char,
+            name: *const c_char,
+            result: *mut *mut c_void,
+        ) -> c_int;
+        fn snd_config_search(
+            config: *mut c_void,
+            key: *const c_char,
+            result: *mut *mut c_void,
+        ) -> c_int;
+        fn snd_config_get_string(config: *const c_void, result: *mut *const c_char) -> c_int;
+        #[cfg(test)]
+        fn snd_config_load_string(
+            config: *mut *mut c_void,
+            text: *const c_char,
+            size: usize,
+        ) -> c_int;
+    }
+
+    struct Config {
+        raw: *mut c_void,
+        shared: bool,
+    }
+
+    impl Drop for Config {
+        fn drop(&mut self) {
+            unsafe {
+                if self.shared {
+                    snd_config_unref(self.raw);
+                } else {
+                    let _ = snd_config_delete(self.raw);
+                }
+            }
+        }
+    }
+
+    fn definition(root: *mut c_void, base: &CStr, name: &CStr) -> anyhow::Result<Config> {
+        let mut raw = std::ptr::null_mut();
+        let status =
+            unsafe { snd_config_search_definition(root, base.as_ptr(), name.as_ptr(), &mut raw) };
+        ensure!(
+            status >= 0 && !raw.is_null(),
+            "Could not resolve ALSA input configuration {name:?}: {status}"
+        );
+        Ok(Config { raw, shared: false })
+    }
+
+    fn child(config: *mut c_void, key: &CStr) -> Option<*mut c_void> {
+        let mut raw = std::ptr::null_mut();
+        let status = unsafe { snd_config_search(config, key.as_ptr(), &mut raw) };
+        (status >= 0 && !raw.is_null()).then_some(raw)
+    }
+
+    fn string(config: *mut c_void) -> Option<CString> {
+        let mut value = std::ptr::null();
+        let status = unsafe { snd_config_get_string(config, &mut value) };
+        if status < 0 || value.is_null() {
+            return None;
+        }
+        Some(unsafe { CStr::from_ptr(value) }.to_owned())
+    }
+
+    fn nested_pcm(
+        root: *mut c_void,
+        node: *mut c_void,
+        key: &CStr,
+        depth: usize,
+    ) -> anyhow::Result<bool> {
+        let node = child(node, key).context("ALSA input slave is missing")?;
+        let named = string(node)
+            .map(|name| definition(root, c"pcm_slave", &name))
+            .transpose()?;
+        let slave = named.as_ref().map_or(node, |config| config.raw);
+        let pcm = child(slave, c"pcm").context("ALSA input slave PCM is missing")?;
+        node_uses_pulse(root, pcm, depth + 1)
+    }
+
+    fn node_uses_pulse(root: *mut c_void, node: *mut c_void, depth: usize) -> anyhow::Result<bool> {
+        ensure!(
+            depth < 32,
+            "ALSA input configuration exceeds the alias depth limit"
+        );
+        if let Some(name) = string(node) {
+            let resolved = definition(root, c"pcm", &name)?;
+            return node_uses_pulse(root, resolved.raw, depth + 1);
+        }
+        let kind = child(node, c"type")
+            .and_then(string)
+            .context("ALSA input plugin type is missing")?;
+        match kind.as_bytes() {
+            b"pulse" => Ok(true),
+            b"asym" => nested_pcm(root, node, c"capture", depth),
+            b"file" if child(node, c"infile").is_some() => Ok(false),
+            b"plug" | b"rate" | b"route" | b"linear" | b"lfloat" | b"copy" | b"softvol"
+            | b"dsnoop" | b"mmap_emul" | b"file" => nested_pcm(root, node, c"slave", depth),
+            _ if child(node, c"slave").is_some() => nested_pcm(root, node, c"slave", depth),
+            b"multi" => {
+                bail!("ALSA input has multiple backends; cannot identify a single Pulse route")
+            }
+            _ => Ok(false),
+        }
+    }
+
+    pub(super) fn uses_pulse(device_name: &str) -> anyhow::Result<bool> {
+        let name = CString::new(device_name).context("Invalid ALSA input name")?;
+        let mut raw = std::ptr::null_mut();
+        let status = unsafe { snd_config_update_ref(&mut raw) };
+        if status < 0 || raw.is_null() {
+            return Err(anyhow!("Could not read ALSA input configuration: {status}"));
+        }
+        let root = Config { raw, shared: true };
+        let input = definition(root.raw, c"pcm", &name)?;
+        node_uses_pulse(root.raw, input.raw, 0)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn configured_input_uses_pulse(text: &str) -> anyhow::Result<bool> {
+            let text = CString::new(text)?;
+            let mut raw = std::ptr::null_mut();
+            let status =
+                unsafe { snd_config_load_string(&mut raw, text.as_ptr(), text.as_bytes().len()) };
+            ensure!(
+                status >= 0 && !raw.is_null(),
+                "ALSA test configuration failed: {status}"
+            );
+            let root = Config { raw, shared: false };
+            let input = definition(root.raw, c"pcm", c"default")?;
+            node_uses_pulse(root.raw, input.raw, 0)
+        }
+
+        #[test]
+        fn direct_default_is_not_mistaken_for_pulse() {
+            assert!(!configured_input_uses_pulse("pcm.default { type hw card 0 }").unwrap());
+            assert!(!configured_input_uses_pulse("pcm.default { type custom_hardware }").unwrap());
+        }
+
+        #[test]
+        fn pulse_default_aliases_and_plug_chains_are_detected() {
+            assert!(
+                configured_input_uses_pulse(
+                    "pcm.default pulse_input\npcm.pulse_input { type pulse }"
+                )
+                .unwrap()
+            );
+            assert!(configured_input_uses_pulse("pcm.default { type plug slave.pcm inner }\npcm.inner { type rate slave.pcm { type pulse } }").unwrap());
+        }
+
+        #[test]
+        fn asymmetric_default_checks_capture_instead_of_playback() {
+            assert!(!configured_input_uses_pulse("pcm.default { type asym playback.pcm { type pulse } capture.pcm { type hw card 0 } }").unwrap());
+            assert!(configured_input_uses_pulse("pcm.default { type asym playback.pcm { type hw card 0 } capture.pcm { type pulse } }").unwrap());
+        }
+
+        #[test]
+        fn named_slaves_and_file_inputs_keep_their_capture_backend() {
+            assert!(configured_input_uses_pulse("pcm.default { type plug slave captured }\npcm_slave.captured { pcm { type pulse } }").unwrap());
+            assert!(!configured_input_uses_pulse("pcm.default { type plug slave.pcm { type file infile synthetic.raw slave.pcm { type null } } }").unwrap());
+        }
+
+        #[test]
+        fn malformed_or_ambiguous_inputs_do_not_claim_a_pulse_route() {
+            for wrapper in [
+                "plug",
+                "rate",
+                "route",
+                "linear",
+                "lfloat",
+                "copy",
+                "softvol",
+                "dsnoop",
+                "mmap_emul",
+                "file",
+            ] {
+                assert!(
+                    configured_input_uses_pulse(&format!("pcm.default {{ type {wrapper} }}"))
+                        .is_err()
+                );
+            }
+            assert!(configured_input_uses_pulse("pcm.default { type multi }").is_err());
+        }
+    }
+}
+
+pub(crate) struct PulseInputRoute {
+    source: String,
+    source_index: u32,
+    previous_outputs: Vec<PactlSourceOutput>,
+}
+
+impl PulseInputRoute {
+    pub(crate) fn prepare(device_name: &str, role: PulseInputRole) -> anyhow::Result<Option<Self>> {
+        if !uses_default_pulse_input(device_name) {
+            return Ok(None);
+        }
+        let default_source = pactl_default_source();
+        if default_source.is_none() && role == PulseInputRole::Microphone {
+            return Ok(None);
+        }
+        if !alsa_input_backend::uses_pulse(device_name)? {
+            anyhow::ensure!(
+                role != PulseInputRole::SystemAudio,
+                "The selected ALSA input is not a Pulse system-audio monitor"
+            );
+            return Ok(None);
+        }
+        let default_sink = pactl_default_sink();
+        let sources = Command::new("pactl")
+            .args(["list", "short", "sources"])
+            .output()
+            .context("inspect the default PulseAudio/PipeWire input")?;
+        if !sources.status.success() {
+            anyhow::ensure!(
+                role != PulseInputRole::SystemAudio,
+                "Could not inspect Linux system-audio monitor sources"
+            );
+            return Ok(None);
+        }
+        let Some((source_index, source)) = pulse_input_route_destination(
+            &String::from_utf8_lossy(&sources.stdout),
+            role,
+            default_source.as_deref(),
+            default_sink.as_deref(),
+        ) else {
+            anyhow::ensure!(
+                role != PulseInputRole::SystemAudio,
+                "No Linux system-audio monitor source is available"
+            );
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            source,
+            source_index,
+            previous_outputs: current_process_source_outputs()?,
+        }))
+    }
+
+    pub(crate) fn apply(
+        self,
+        input_callback_observed: &AtomicBool,
+        cancel: &CancellationToken,
+    ) -> anyhow::Result<()> {
+        let output = wait_for_started_source_output(
+            &self.previous_outputs,
+            input_callback_observed,
+            cancel,
+            current_process_source_outputs,
+        )?;
+        if output.source != self.source_index {
+            // Pulse remembers the generic ALSA application's last route, including speaker capture.
+            move_pactl_source_output(output.id, &self.source)?;
+        }
+        Ok(())
+    }
+}
+
+fn pulse_input_route_destination(
+    sources: &str,
+    role: PulseInputRole,
+    default_source: Option<&str>,
+    default_sink: Option<&str>,
+) -> Option<(u32, String)> {
+    match role {
+        PulseInputRole::Microphone => {
+            let source = default_source?;
+            Some((pactl_source_index(sources, source)?, source.to_string()))
+        }
+        PulseInputRole::SystemAudio => sources
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split_whitespace();
+                let index = fields.next()?.parse::<u32>().ok()?;
+                let name = fields.next()?;
+                let rank = pactl_monitor_preference(name, default_sink)?;
+                Some((rank, name.to_ascii_lowercase(), index, name.to_string()))
+            })
+            .min()
+            .map(|(_, _, index, name)| (index, name)),
+    }
+}
+
+fn wait_for_started_source_output(
+    previous_outputs: &[PactlSourceOutput],
+    input_callback_observed: &AtomicBool,
+    cancel: &CancellationToken,
+    mut current_outputs: impl FnMut() -> anyhow::Result<Vec<PactlSourceOutput>>,
+) -> anyhow::Result<PactlSourceOutput> {
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(3) {
+        anyhow::ensure!(
+            !cancel.is_cancelled(),
+            "Linux input route confirmation cancelled"
+        );
+        let has_captured_audio = input_callback_observed.load(Ordering::Acquire);
+        let outputs = current_outputs()?;
+        if let Some(id) =
+            started_input_source_output(previous_outputs, &outputs, has_captured_audio)?
+        {
+            return outputs
+                .into_iter()
+                .find(|output| output.id == id)
+                .ok_or_else(|| anyhow!("The started PulseAudio/PipeWire input disappeared"));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    bail!("The PulseAudio/PipeWire input did not start delivering audio within three seconds")
+}
+
+fn started_input_source_output(
+    previous: &[PactlSourceOutput],
+    current: &[PactlSourceOutput],
+    input_callback_observed: bool,
+) -> anyhow::Result<Option<u32>> {
+    if !input_callback_observed
+        || !current
+            .iter()
+            .any(|output| !previous.iter().any(|previous| previous.id == output.id))
+    {
+        return Ok(None);
+    }
+    newly_created_source_output(previous, current).map(Some)
+}
+
+fn uses_default_pulse_input(device_name: &str) -> bool {
+    device_name.eq_ignore_ascii_case("default") || device_name.eq_ignore_ascii_case("pulse")
 }
 
 impl AudioSource for SystemAudioSource {
@@ -840,16 +1781,25 @@ impl AudioSource for SystemAudioSource {
         Self: Sized,
     {
         let device_name = config.device_name.clone();
-        let restore_source = config.restore_source;
-        let setup = <crate::sources::Microphone as AudioSource>::setup(config.feed_lock, tx, ctx);
+        let setup = crate::sources::Microphone::setup_with_channels(
+            config.feed_lock,
+            tx,
+            ctx,
+            X11Capture::audio_info().channels,
+        );
         async move {
             let inner = setup
                 .await
                 .with_context(|| format!("set up Linux system audio source '{device_name}'"))?;
 
+            if let Some(route) = config.monitor_route.as_ref() {
+                apply_pactl_monitor_route(route)?;
+            }
+
             Ok(Self {
                 inner,
-                restore_source,
+                monitor_route: config.monitor_route,
+                feed: config.feed,
             })
         }
     }
@@ -858,39 +1808,70 @@ impl AudioSource for SystemAudioSource {
         self.inner.audio_info()
     }
 
-    fn stop(&mut self) -> impl std::future::Future<Output = anyhow::Result<()>> + Send {
-        let restore_source = self.restore_source.take();
-        let stop = self.inner.stop();
-        async move {
-            let result = stop.await;
-            if let Some(source) = restore_source {
-                restore_pactl_default_source(&source);
-            }
-            result
-        }
+    async fn stop(&mut self) -> anyhow::Result<()> {
+        drop(self.monitor_route.take());
+        self.inner.stop().await?;
+        self.feed.actor.kill();
+        self.feed.actor.wait_for_stop().await;
+        self.feed.stopped = true;
+        Ok(())
     }
 }
 
 async fn create_system_audio_source_config() -> anyhow::Result<SystemAudioSourceConfig> {
-    let selected = select_system_audio_monitor()?;
-
     let (error_tx, _error_rx) = flume::bounded(16);
-    let feed = MicrophoneFeed::spawn(MicrophoneFeed::new(error_tx));
-    feed.ask(microphone::SetInput {
-        label: selected.device_name.clone(),
-        settings: None,
-    })
-    .await
-    .map_err(|e| anyhow!("Failed to set Linux system audio input: {e}"))?
-    .await
-    .with_context(|| {
-        format!(
-            "Linux system audio input '{}' failed to connect",
-            selected.device_name
-        )
-    })?;
+    let feed = MicrophoneFeed::spawn(MicrophoneFeed::new_system_audio(error_tx));
+    let owned_feed = OwnedSystemAudioFeed {
+        actor: feed.clone(),
+        build_scope: crate::output_pipeline::PipelineBuildScope::current(),
+        stopped: false,
+    };
+    let (device_name, monitor_route) = retry_system_audio_connection(
+        || async {
+            let selected = select_system_audio_monitor()?;
+            let device_name = selected.device_name.clone();
+            feed.ask(microphone::SetInput {
+                label: device_name.clone(),
+                settings: None,
+            })
+            .await
+            .map_err(|e| anyhow!("Failed to set Linux system audio input: {e}"))?
+            .await
+            .with_context(|| {
+                format!("Linux system audio input '{device_name}' failed to connect")
+            })?;
 
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let route = selected.into_monitor_route()?;
+            if let Some(route) = route.as_ref() {
+                apply_pactl_monitor_route(route)?;
+            }
+            let routed_at = cap_timestamp::Timestamps::now();
+            let (sender, receiver) = flume::bounded(1);
+            feed.ask(microphone::AddSender(sender.clone()))
+                .await
+                .map_err(|e| anyhow!("Failed to observe Linux system audio startup: {e}"))?;
+            let ready = wait_for_audio_after_route(
+                receiver.stream().map(|samples| samples.timestamp),
+                routed_at,
+            )
+            .await;
+            feed.ask(microphone::RemoveSender(sender))
+                .await
+                .map_err(|e| {
+                    anyhow!("Failed to detach the Linux system audio startup observer: {e}")
+                })?;
+            ready?;
+            Ok((device_name, route))
+        },
+        || async {
+            feed.ask(microphone::RemoveInput)
+                .await
+                .map_err(|e| anyhow!("Failed to close the unrouted Linux system audio input: {e}"))
+        },
+    )
+    .await?;
 
     let lock = feed
         .ask(microphone::Lock)
@@ -899,41 +1880,157 @@ async fn create_system_audio_source_config() -> anyhow::Result<SystemAudioSource
 
     Ok(SystemAudioSourceConfig {
         feed_lock: Arc::new(lock),
-        device_name: selected.device_name,
-        restore_source: selected.restore_source,
+        device_name,
+        monitor_route,
+        feed: owned_feed,
     })
 }
 
-impl Drop for SystemAudioSource {
-    fn drop(&mut self) {
-        if let Some(source) = self.restore_source.take() {
-            restore_pactl_default_source(&source);
+async fn wait_for_audio_after_route(
+    timestamps: impl Stream<Item = Timestamp>,
+    routed_at: cap_timestamp::Timestamps,
+) -> anyhow::Result<()> {
+    futures::pin_mut!(timestamps);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(timestamp) = timestamps.next().await {
+            if timestamp.checked_duration_since(routed_at).is_some() {
+                return Ok(());
+            }
+        }
+        bail!("Linux system audio input closed before delivering routed audio")
+    })
+    .await
+    .context("Linux system audio input did not resume after routing within three seconds")?
+}
+
+async fn retry_system_audio_connection<T, ConnectFuture, DisconnectFuture>(
+    mut connect: impl FnMut() -> ConnectFuture,
+    mut disconnect: impl FnMut() -> DisconnectFuture,
+) -> anyhow::Result<T>
+where
+    ConnectFuture: std::future::Future<Output = anyhow::Result<T>>,
+    DisconnectFuture: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let mut remaining_retries = 2;
+    loop {
+        match connect().await {
+            Ok(input) => return Ok(input),
+            Err(error) => {
+                disconnect().await?;
+                if remaining_retries == 0 {
+                    return Err(error)
+                        .context("Linux system audio could not reach the output monitor");
+                }
+                remaining_retries -= 1;
+                tracing::warn!(%error, remaining_retries, "Reconnecting the Linux system-audio input after routing failed");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
         }
     }
 }
 
 struct SelectedSystemAudioInput {
     device_name: String,
-    restore_source: Option<String>,
+    monitor_source: Option<String>,
+    monitor_source_index: Option<u32>,
+    default_source: Option<String>,
+    default_source_index: Option<u32>,
+    previous_process_source_outputs: Vec<PactlSourceOutput>,
+}
+
+impl SelectedSystemAudioInput {
+    fn into_monitor_route(self) -> anyhow::Result<Option<PactlMonitorRoute>> {
+        let Some(monitor_source) = self.monitor_source else {
+            return Ok(None);
+        };
+        let current_source_outputs = current_process_source_outputs()?;
+        let source_output = newly_created_source_output(
+            &self.previous_process_source_outputs,
+            &current_source_outputs,
+        )?;
+        let original_source = current_source_outputs
+            .iter()
+            .find(|output| output.id == source_output)
+            .ok_or_else(|| anyhow!("PulseAudio/PipeWire system-audio stream disappeared"))?
+            .source;
+
+        Ok(Some(PactlMonitorRoute {
+            monitor_source,
+            monitor_source_index: self.monitor_source_index.ok_or_else(|| {
+                anyhow!("PulseAudio/PipeWire monitor source has no routing index")
+            })?,
+            default_source: self.default_source,
+            default_source_index: self.default_source_index,
+            source_output,
+            original_source,
+            previous_process_source_outputs: self.previous_process_source_outputs,
+        }))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PactlSourceOutput {
+    id: u32,
+    source: u32,
+}
+
+fn apply_pactl_monitor_route(route: &PactlMonitorRoute) -> anyhow::Result<()> {
+    let mut current_source_outputs = current_process_source_outputs()?;
+    let current_system_source = current_source_outputs
+        .iter()
+        .find(|source_output| source_output.id == route.source_output)
+        .ok_or_else(|| anyhow!("PulseAudio/PipeWire system-audio stream is no longer active"))?;
+
+    if source_output_needs_move(
+        current_system_source.source,
+        Some(route.monitor_source_index),
+    ) {
+        move_pactl_source_output(route.source_output, &route.monitor_source)?;
+        current_source_outputs = current_process_source_outputs()?;
+    }
+
+    for previous_output in &route.previous_process_source_outputs {
+        if let Some(current_output) = current_source_outputs
+            .iter()
+            .find(|current_output| current_output.id == previous_output.id)
+        {
+            let destination = previous_source_destination(
+                previous_output.source,
+                route.monitor_source_index,
+                &route.monitor_source,
+                route.default_source.as_deref(),
+            );
+            let destination_index = if destination == previous_output.source.to_string() {
+                Some(previous_output.source)
+            } else {
+                route.default_source_index
+            };
+
+            if source_output_needs_move(current_output.source, destination_index) {
+                move_pactl_source_output(previous_output.id, &destination)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn source_output_needs_move(current_source: u32, target_source: Option<u32>) -> bool {
+    target_source != Some(current_source)
 }
 
 fn select_system_audio_monitor() -> anyhow::Result<SelectedSystemAudioInput> {
     let devices = MicrophoneFeed::list();
     let available = devices.keys().cloned().collect::<Vec<_>>();
 
-    let mut candidates = devices
-        .iter()
-        .filter_map(|(name, device)| {
-            system_audio_device_rank(&name).map(|rank| (rank, name, device))
-        })
-        .collect::<Vec<_>>();
-
-    candidates.sort_by_key(|(rank, name, _)| (*rank, name.to_ascii_lowercase()));
-
-    if let Some((_, name, _)) = candidates.into_iter().next() {
+    if let Some(name) = preferred_system_audio_device(&available, false) {
         return Ok(SelectedSystemAudioInput {
             device_name: name.to_string(),
-            restore_source: None,
+            monitor_source: None,
+            monitor_source_index: None,
+            default_source: None,
+            default_source_index: None,
+            previous_process_source_outputs: Vec::new(),
         });
     }
 
@@ -941,10 +2038,41 @@ fn select_system_audio_monitor() -> anyhow::Result<SelectedSystemAudioInput> {
         return Ok(selected);
     }
 
+    if let Some(name) = preferred_system_audio_device(&available, true) {
+        return Ok(SelectedSystemAudioInput {
+            device_name: name.to_string(),
+            monitor_source: None,
+            monitor_source_index: None,
+            default_source: None,
+            default_source_index: None,
+            previous_process_source_outputs: Vec::new(),
+        });
+    }
+
     Err(anyhow!(
         "No PulseAudio/PipeWire monitor input was found for Linux system audio. \
         Available input devices: {available:?}. Select a monitor source with --mic, or enable a monitor source in your audio server."
     ))
+}
+
+fn preferred_system_audio_device(
+    available_devices: &[String],
+    include_ambiguous: bool,
+) -> Option<&str> {
+    available_devices
+        .iter()
+        .filter_map(|name| {
+            let rank = system_audio_device_rank(name)?;
+            (include_ambiguous || rank < 2).then_some((rank, name.as_str()))
+        })
+        .min_by(|(left_rank, left_name), (right_rank, right_name)| {
+            left_rank.cmp(right_rank).then_with(|| {
+                left_name
+                    .to_ascii_lowercase()
+                    .cmp(&right_name.to_ascii_lowercase())
+            })
+        })
+        .map(|(_, name)| name)
 }
 
 fn system_audio_device_rank(name: &str) -> Option<u8> {
@@ -963,42 +2091,205 @@ fn system_audio_device_rank(name: &str) -> Option<u8> {
 fn select_pactl_monitor_source(
     available_devices: &[String],
 ) -> anyhow::Result<Option<SelectedSystemAudioInput>> {
-    let Some(device_name) = pulse_cpal_device_name(available_devices) else {
-        return Ok(None);
-    };
-
     let output = match Command::new("pactl")
         .args(["list", "short", "sources"])
         .output()
     {
         Ok(output) if output.status.success() => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow!(
+                "Linux system audio capture needs `pactl` to discover monitor sources, \
+                but it was not found on PATH. Install it with `apt install pulseaudio-utils`, \
+                `dnf install pulseaudio-utils`, or `pacman -S libpulse`, then try again. \
+                Available input devices: {available_devices:?}."
+            ));
+        }
         _ => return Ok(None),
     };
 
-    let sources = String::from_utf8_lossy(&output.stdout);
-    let mut monitor_sources = sources
-        .lines()
-        .filter_map(|line| line.split_whitespace().nth(1))
-        .filter_map(|name| pactl_monitor_rank(name).map(|rank| (rank, name.to_string())))
-        .collect::<Vec<_>>();
-    monitor_sources.sort_by_key(|(rank, name)| (*rank, name.to_ascii_lowercase()));
-
-    let Some((_, source)) = monitor_sources.into_iter().next() else {
+    let Some(device_name) = pulse_cpal_device_name(available_devices) else {
         return Ok(None);
     };
 
-    let previous_source = pactl_default_source();
-    let restore_source = if previous_source.as_deref() == Some(source.as_str()) {
-        None
-    } else {
-        set_pactl_default_source(&source)?;
-        previous_source
+    let sources = String::from_utf8_lossy(&output.stdout);
+    let default_sink = pactl_default_sink();
+    let mut monitor_sources = sources
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let index = fields.next()?.parse::<u32>().ok()?;
+            let name = fields.next()?;
+
+            pactl_monitor_preference(name, default_sink.as_deref())
+                .map(|rank| (rank, name.to_string(), index))
+        })
+        .collect::<Vec<_>>();
+    monitor_sources.sort_by_key(|(rank, name, _)| (*rank, name.to_ascii_lowercase()));
+
+    let Some((_, source, source_index)) = monitor_sources.into_iter().next() else {
+        return Ok(None);
     };
+
+    let previous_process_source_outputs = current_process_source_outputs()?;
+    let default_source = pactl_default_source();
+    let default_source_index = default_source
+        .as_deref()
+        .and_then(|source| pactl_source_index(&sources, source));
 
     Ok(Some(SelectedSystemAudioInput {
         device_name,
-        restore_source,
+        monitor_source: Some(source),
+        monitor_source_index: Some(source_index),
+        default_source,
+        default_source_index,
+        previous_process_source_outputs,
     }))
+}
+
+fn pactl_source_index(sources: &str, name: &str) -> Option<u32> {
+    sources.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let index = fields.next()?.parse::<u32>().ok()?;
+
+        (fields.next()? == name).then_some(index)
+    })
+}
+
+fn previous_source_destination(
+    previous_source: u32,
+    monitor_source: u32,
+    monitor_name: &str,
+    default_source: Option<&str>,
+) -> String {
+    if previous_source == monitor_source
+        && let Some(default_source) = default_source
+        && default_source != monitor_name
+    {
+        default_source.to_string()
+    } else {
+        previous_source.to_string()
+    }
+}
+
+fn current_process_source_outputs() -> anyhow::Result<Vec<PactlSourceOutput>> {
+    let output = Command::new("pactl")
+        .args(["-f", "json", "list", "source-outputs"])
+        .output()
+        .context("list PulseAudio/PipeWire source outputs")?;
+
+    if !output.status.success() {
+        bail!("Could not inspect PulseAudio/PipeWire source outputs for isolated system audio");
+    }
+
+    let outputs: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
+        .context("parse PulseAudio/PipeWire source outputs")?;
+    process_source_output_ids(&outputs, &std::process::id().to_string())
+}
+
+fn process_source_output_ids(
+    outputs: &[serde_json::Value],
+    process_id: &str,
+) -> anyhow::Result<Vec<PactlSourceOutput>> {
+    outputs
+        .iter()
+        .filter(|output| {
+            output["properties"]["application.process.id"]
+                .as_str()
+                .is_some_and(|id| id == process_id)
+        })
+        .map(|output| {
+            let id = output["index"]
+                .as_u64()
+                .and_then(|index| u32::try_from(index).ok())
+                .ok_or_else(|| anyhow!("PulseAudio/PipeWire source output has an invalid index"))?;
+            let source = output["source"]
+                .as_u64()
+                .and_then(|source| u32::try_from(source).ok())
+                .ok_or_else(|| {
+                    anyhow!("PulseAudio/PipeWire source output has an invalid source")
+                })?;
+
+            Ok(PactlSourceOutput { id, source })
+        })
+        .collect()
+}
+
+fn newly_created_source_output(
+    previous: &[PactlSourceOutput],
+    current: &[PactlSourceOutput],
+) -> anyhow::Result<u32> {
+    let mut created = current
+        .iter()
+        .filter(|source_output| {
+            !previous
+                .iter()
+                .any(|previous_output| previous_output.id == source_output.id)
+        })
+        .map(|source_output| source_output.id);
+
+    match (created.next(), created.next()) {
+        (Some(source_output), None) => Ok(source_output),
+        (None, _) => bail!("Could not identify the PulseAudio/PipeWire system-audio stream"),
+        (Some(_), Some(_)) => {
+            bail!("Multiple PulseAudio/PipeWire system-audio streams started simultaneously")
+        }
+    }
+}
+
+fn move_pactl_source_output(source_output: u32, source: &str) -> anyhow::Result<()> {
+    let source_index = match source.parse::<u32>() {
+        Ok(index) => index,
+        Err(_) => {
+            let sources = Command::new("pactl")
+                .args(["list", "short", "sources"])
+                .output()
+                .context("resolve PulseAudio/PipeWire routing destination")?;
+            if !sources.status.success() {
+                bail!("Could not inspect PulseAudio/PipeWire routing destinations");
+            }
+            pactl_source_index(&String::from_utf8_lossy(&sources.stdout), source).ok_or_else(
+                || anyhow!("PulseAudio/PipeWire routing destination '{source}' disappeared"),
+            )?
+        }
+    };
+    let status = Command::new("pactl")
+        .args(["move-source-output", &source_output.to_string(), source])
+        .status()
+        .context("move PulseAudio/PipeWire system-audio stream")?;
+
+    if !status.success() {
+        bail!(
+            "Could not route PulseAudio/PipeWire system-audio stream {source_output} to '{source}'"
+        );
+    }
+
+    for _ in 0..10 {
+        if source_output_route_matches(
+            &current_process_source_outputs()?,
+            source_output,
+            source_index,
+        )? {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    bail!(
+        "PulseAudio/PipeWire acknowledged routing stream {source_output} to '{source}', but the input did not change"
+    )
+}
+
+fn source_output_route_matches(
+    outputs: &[PactlSourceOutput],
+    source_output: u32,
+    source_index: u32,
+) -> anyhow::Result<bool> {
+    outputs
+        .iter()
+        .find(|output| output.id == source_output)
+        .map(|output| output.source == source_index)
+        .ok_or_else(|| {
+            anyhow!("PulseAudio/PipeWire stream {source_output} disappeared while routing")
+        })
 }
 
 fn pulse_cpal_device_name(available_devices: &[String]) -> Option<String> {
@@ -1029,39 +2320,32 @@ fn pactl_monitor_rank(name: &str) -> Option<u8> {
     }
 }
 
+fn pactl_monitor_preference(name: &str, default_sink: Option<&str>) -> Option<(u8, u8)> {
+    let rank = pactl_monitor_rank(name)?;
+    let is_default_sink = default_sink.is_some_and(|sink| {
+        name.strip_suffix(".monitor")
+            .is_some_and(|monitor_sink| monitor_sink == sink)
+    });
+
+    Some((u8::from(!is_default_sink), rank))
+}
+
+fn pactl_default_sink() -> Option<String> {
+    pactl_default_device("get-default-sink")
+}
+
 fn pactl_default_source() -> Option<String> {
-    let output = Command::new("pactl")
-        .arg("get-default-source")
-        .output()
-        .ok()?;
+    pactl_default_device("get-default-source")
+}
+
+fn pactl_default_device(command: &str) -> Option<String> {
+    let output = Command::new("pactl").arg(command).output().ok()?;
 
     output
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|source| !source.is_empty())
-}
-
-fn set_pactl_default_source(source: &str) -> anyhow::Result<()> {
-    let status = Command::new("pactl")
-        .args(["set-default-source", source])
-        .status()
-        .context("run pactl set-default-source")?;
-
-    status
-        .success()
-        .then_some(())
-        .ok_or_else(|| anyhow!("pactl set-default-source '{source}' failed"))
-}
-
-fn restore_pactl_default_source(source: &str) {
-    if let Err(error) = set_pactl_default_source(source) {
-        tracing::warn!(
-            source,
-            error = %error,
-            "Failed to restore PulseAudio/PipeWire default source after Linux system audio capture"
-        );
-    }
+        .filter(|sink| !sink.is_empty())
 }
 
 struct FrameScaler {
@@ -1126,13 +2410,14 @@ impl FrameScaler {
 }
 
 fn capture_x11(
-    _video_info: VideoInfo,
+    video_info: VideoInfo,
     input_config: X11InputConfig,
     mut video_tx: mpsc::Sender<FFmpegVideoFrame>,
     stop_token: CancellationToken,
     health_tx: output_pipeline::HealthSender,
 ) -> anyhow::Result<()> {
     let mut grabber = X11Grabber::new(&input_config)?;
+    grabber.output = video_info;
     let frame_interval = Duration::from_secs_f64(1.0 / f64::from(input_config.fps.max(1)));
     let started = Instant::now();
     let mut next_capture = Instant::now();
@@ -1142,6 +2427,7 @@ fn capture_x11(
     while !stop_token.is_cancelled() {
         let mut frame = match grabber.grab() {
             Ok(frame) => frame,
+            Err(error) if input_config.window_id.is_some() => return Err(error),
             Err(error) => {
                 // X11 servers can transiently fail GetImage (e.g. while the
                 // root geometry changes). Log, back off one interval, retry.
@@ -1194,21 +2480,43 @@ fn capture_x11(
 /// FFmpeg (spacedrive native-deps) is built without. Capturing with `x11rb`
 /// keeps us off any system FFmpeg/libavdevice and adds no new runtime
 /// shared-library dependency (`x11rb` speaks the X11 protocol over a socket).
-pub(crate) struct X11Grabber {
-    conn: RustConnection,
+// `pub` only so the x11-capture-benchmark example and x11_shm_capture tests can
+// drive it; not a supported API.
+#[doc(hidden)]
+pub struct X11Grabber {
+    conn: Arc<RustConnection>,
     root: x11rb::protocol::xproto::Window,
+    window: Option<X11WindowCapture>,
     x: i16,
     y: i16,
     width: u16,
     height: u16,
     source_pixel: ffmpeg::format::Pixel,
+    bits_per_pixel: u8,
+    scanline_pad: u8,
+    backend: GrabBackend,
     output: VideoInfo,
     scaler: Option<FrameScaler>,
     show_cursor: bool,
 }
 
+enum GrabBackend {
+    Shm(ShmSegment),
+    GetImage,
+}
+
+struct X11WindowCapture {
+    id: u32,
+    pixmap: u32,
+    border_width: u16,
+}
+
 impl X11Grabber {
-    pub(crate) fn new(config: &X11InputConfig) -> anyhow::Result<Self> {
+    pub fn new(config: &X11InputConfig) -> anyhow::Result<Self> {
+        Self::with_shm(config, true)
+    }
+
+    pub fn with_shm(config: &X11InputConfig, allow_shm: bool) -> anyhow::Result<Self> {
         ffmpeg::init().context("initialize FFmpeg")?;
 
         let (conn, screen_num) = x11rb::connect(Some(config.display_name.as_str()))
@@ -1220,22 +2528,38 @@ impl X11Grabber {
             .get(screen_num)
             .ok_or_else(|| anyhow!("X11 screen {screen_num} not found"))?;
         let root = screen.root;
-        let root_depth = screen.root_depth;
-        let root_visual_id = screen.root_visual;
+        let visual_id = match config.window_id {
+            Some(id) => {
+                if id == root || id == 0 {
+                    bail!("X11 window capture requires a non-root window");
+                }
+                conn.get_window_attributes(id)
+                    .context("request X11 window attributes")?
+                    .reply()
+                    .context("read X11 window attributes")?
+                    .visual
+            }
+            None => screen.root_visual,
+        };
 
-        let visual = screen
+        let (depth, visual) = screen
             .allowed_depths
             .iter()
-            .flat_map(|depth| depth.visuals.iter())
-            .find(|visual| visual.visual_id == root_visual_id)
-            .ok_or_else(|| anyhow!("X11 root visual {root_visual_id} not found"))?;
+            .find_map(|depth| {
+                depth
+                    .visuals
+                    .iter()
+                    .find(|visual| visual.visual_id == visual_id)
+                    .map(|visual| (depth.depth, visual))
+            })
+            .ok_or_else(|| anyhow!("X11 visual {visual_id} not found"))?;
 
-        let bits_per_pixel = setup
+        let (bits_per_pixel, scanline_pad) = setup
             .pixmap_formats
             .iter()
-            .find(|format| format.depth == root_depth)
-            .map(|format| format.bits_per_pixel)
-            .ok_or_else(|| anyhow!("X11 pixmap format for depth {root_depth} not found"))?;
+            .find(|format| format.depth == depth)
+            .map(|format| (format.bits_per_pixel, format.scanline_pad))
+            .ok_or_else(|| anyhow!("X11 pixmap format for depth {depth} not found"))?;
 
         let source_pixel = x11_source_pixel(
             setup.image_byte_order == ImageOrder::MSB_FIRST,
@@ -1274,29 +2598,256 @@ impl X11Grabber {
             config.fps.max(1),
         );
 
-        Ok(Self {
-            conn,
+        let window = if let Some(id) = config.window_id {
+            let version = conn
+                .composite_query_version(0, 4)
+                .context("XComposite is required for isolated window capture")?
+                .reply()
+                .context("query XComposite version")?;
+            if version.major_version == 0 && version.minor_version < 2 {
+                bail!("XComposite 0.2 or later is required for isolated window capture");
+            }
+            conn.change_window_attributes(
+                id,
+                &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
+            )?
+            .check()?;
+            conn.composite_redirect_window(id, Redirect::AUTOMATIC)
+                .context("redirect X11 window for isolated capture")?
+                .check()
+                .context("enable isolated X11 window capture")?;
+            Some(X11WindowCapture {
+                id,
+                pixmap: 0,
+                border_width: 0,
+            })
+        } else {
+            None
+        };
+
+        let mut grabber = Self {
+            conn: Arc::new(conn),
             root,
+            window,
             x,
             y,
             width,
             height,
             source_pixel,
+            bits_per_pixel,
+            scanline_pad,
+            backend: GrabBackend::GetImage,
             output,
             scaler: None,
             show_cursor,
+        };
+        grabber.refresh_window_pixmap()?;
+        grabber.backend = grabber.initial_backend(allow_shm);
+        Ok(grabber)
+    }
+
+    fn initial_backend(&self, allow_shm: bool) -> GrabBackend {
+        if !allow_shm {
+            tracing::info!("X11 MIT-SHM capture disabled by caller");
+            return GrabBackend::GetImage;
+        }
+        if linux_shm::shm_disabled_by_env() {
+            tracing::info!(
+                "X11 MIT-SHM capture disabled by {}",
+                linux_shm::DISABLE_SHM_ENV
+            );
+            return GrabBackend::GetImage;
+        }
+        match self.create_shm_segment() {
+            Ok(segment) => {
+                tracing::info!(bytes = segment.len(), "X11 capture using MIT-SHM");
+                GrabBackend::Shm(segment)
+            }
+            Err(error) => {
+                tracing::info!(error = %format!("{error:#}"), "X11 MIT-SHM unavailable, using GetImage");
+                GrabBackend::GetImage
+            }
+        }
+    }
+
+    fn create_shm_segment(&self) -> anyhow::Result<ShmSegment> {
+        if self.bits_per_pixel != 32 {
+            bail!(
+                "MIT-SHM capture requires 32bpp, server uses {}",
+                self.bits_per_pixel
+            );
+        }
+        linux_shm::query_shm_support(&self.conn)?;
+        ShmSegment::new(&self.conn, self.shm_image_size()?)
+    }
+
+    fn shm_image_size(&self) -> anyhow::Result<usize> {
+        linux_shm::image_size(
+            self.width,
+            self.height,
+            self.bits_per_pixel,
+            self.scanline_pad,
+        )
+        .ok_or_else(|| {
+            anyhow!(
+                "invalid X11 image layout: {}x{} at {}bpp, pad {}",
+                self.width,
+                self.height,
+                self.bits_per_pixel,
+                self.scanline_pad
+            )
         })
     }
 
+    pub fn uses_shm(&self) -> bool {
+        matches!(self.backend, GrabBackend::Shm(_))
+    }
+
+    fn refresh_window_pixmap(&mut self) -> anyhow::Result<()> {
+        let Some(window) = self.window.as_mut() else {
+            return Ok(());
+        };
+        let mut storage_changed = false;
+        while let Some(event) = self.conn.poll_for_event()? {
+            match event {
+                Event::UnmapNotify(event) if event.window == window.id => {
+                    bail!("Selected X11 window was unmapped");
+                }
+                Event::DestroyNotify(event) if event.window == window.id => {
+                    bail!("Selected X11 window was closed");
+                }
+                Event::ConfigureNotify(event) if event.window == window.id => {
+                    storage_changed = true
+                }
+                Event::ReparentNotify(event) if event.window == window.id => storage_changed = true,
+                Event::MapNotify(event) if event.window == window.id => storage_changed = true,
+                _ => {}
+            }
+        }
+        let attributes = self
+            .conn
+            .get_window_attributes(window.id)?
+            .reply()
+            .context("selected X11 window is no longer available")?;
+        if attributes.map_state != MapState::VIEWABLE {
+            bail!("Selected X11 window is no longer viewable");
+        }
+        let geometry = self
+            .conn
+            .get_geometry(window.id)?
+            .reply()
+            .context("read selected X11 window geometry")?;
+        if geometry.width == 0 || geometry.height == 0 {
+            bail!("Selected X11 window has no content");
+        }
+
+        if storage_changed
+            || window.pixmap == 0
+            || self.width != geometry.width
+            || self.height != geometry.height
+            || window.border_width != geometry.border_width
+        {
+            let pixmap = self.conn.generate_id()?;
+            self.conn
+                .composite_name_window_pixmap(window.id, pixmap)?
+                .check()
+                .context("access isolated X11 window pixels")?;
+            let previous = std::mem::replace(&mut window.pixmap, pixmap);
+            if previous != 0 {
+                self.conn.free_pixmap(previous)?.check()?;
+            }
+            self.width = geometry.width;
+            self.height = geometry.height;
+            window.border_width = geometry.border_width;
+        }
+
+        if self.show_cursor {
+            let position = self
+                .conn
+                .translate_coordinates(window.id, self.root, 0, 0)?
+                .reply()
+                .context("locate selected X11 window cursor")?;
+            self.x = position.dst_x;
+            self.y = position.dst_y;
+        }
+        Ok(())
+    }
+
     /// Capture one frame of the configured region as a BGRZ video frame.
-    pub(crate) fn grab(&mut self) -> anyhow::Result<ffmpeg::frame::Video> {
+    pub fn grab(&mut self) -> anyhow::Result<ffmpeg::frame::Video> {
+        self.refresh_window_pixmap()?;
+        let (drawable, x, y) = match &self.window {
+            Some(window) => {
+                let border = i16::try_from(window.border_width)
+                    .context("X11 window border exceeds capture limits")?;
+                (window.pixmap, border, border)
+            }
+            None => (self.root, self.x, self.y),
+        };
+        let mut source = ffmpeg::frame::Video::new(
+            self.source_pixel,
+            u32::from(self.width),
+            u32::from(self.height),
+        );
+        if self.uses_shm() {
+            if let Err(shm_error) = self.read_shm_image(drawable, x, y, &mut source) {
+                // Only abandon MIT-SHM once GetImage succeeds on the same frame;
+                // if both fail the cause is the drawable/region, not SHM.
+                self.read_get_image(drawable, x, y, &mut source)?;
+                tracing::warn!(
+                    error = %format!("{shm_error:#}"),
+                    "X11 MIT-SHM capture failed, switching to GetImage"
+                );
+                self.backend = GrabBackend::GetImage;
+            }
+        } else {
+            self.read_get_image(drawable, x, y, &mut source)?;
+        }
+
+        let mut frame = prepare_pipewire_frame(source, &mut self.scaler, self.output)?;
+
+        if self.show_cursor
+            && let Err(error) = self.composite_cursor(&mut frame)
+        {
+            tracing::trace!(error = %error, "X11 cursor composite skipped");
+        }
+
+        Ok(frame)
+    }
+
+    fn read_shm_image(
+        &mut self,
+        drawable: u32,
+        x: i16,
+        y: i16,
+        dst: &mut ffmpeg::frame::Video,
+    ) -> anyhow::Result<()> {
+        let required = self.shm_image_size()?;
+        let GrabBackend::Shm(segment) = &mut self.backend else {
+            bail!("X11 MIT-SHM backend is not active");
+        };
+        if segment.len() != required {
+            *segment = ShmSegment::new(&self.conn, required)
+                .context("resize X11 shared-memory segment")?;
+        }
+        let data = segment.get_image(drawable, x, y, self.width, self.height)?;
+        copy_image_rows(data, usize::from(self.width), usize::from(self.height), dst)
+    }
+
+    fn read_get_image(
+        &self,
+        drawable: u32,
+        x: i16,
+        y: i16,
+        dst: &mut ffmpeg::frame::Video,
+    ) -> anyhow::Result<()> {
         let reply = self
             .conn
             .get_image(
                 ImageFormat::Z_PIXMAP,
-                self.root,
-                self.x,
-                self.y,
+                drawable,
+                x,
+                y,
                 self.width,
                 self.height,
                 u32::MAX,
@@ -1304,64 +2855,12 @@ impl X11Grabber {
             .context("request X11 image")?
             .reply()
             .context("read X11 image")?;
-
-        let width = usize::from(self.width);
-        let height = usize::from(self.height);
-        let row_bytes = width * 4;
-        let source_stride = reply
-            .data
-            .len()
-            .checked_div(height)
-            .filter(|stride| *stride >= row_bytes)
-            .ok_or_else(|| {
-                anyhow!(
-                    "X11 image too small: {} bytes for {}x{}",
-                    reply.data.len(),
-                    width,
-                    height
-                )
-            })?;
-
-        let mut source = ffmpeg::frame::Video::new(
-            self.source_pixel,
-            u32::from(self.width),
-            u32::from(self.height),
-        );
-        let dst_stride = source.stride(0);
-        let copy = row_bytes.min(dst_stride);
-        for row in 0..height {
-            let src_start = row * source_stride;
-            let dst_start = row * dst_stride;
-            source.data_mut(0)[dst_start..dst_start + copy]
-                .copy_from_slice(&reply.data[src_start..src_start + copy]);
-        }
-
-        // Convert to BGRZ only when the server's visual differs; the common
-        // case (32-bit little-endian BGRX) is already BGRZ and short-circuits.
-        let mut frame = if self.source_pixel == self.output.pixel_format {
-            source
-        } else {
-            if self.scaler.is_none() {
-                self.scaler = Some(FrameScaler::new(
-                    self.source_pixel,
-                    u32::from(self.width),
-                    u32::from(self.height),
-                    self.output,
-                )?);
-            }
-            self.scaler
-                .as_mut()
-                .expect("scaler initialized")
-                .scale(&source, self.output)?
-        };
-
-        if self.show_cursor {
-            if let Err(error) = self.composite_cursor(&mut frame) {
-                tracing::trace!(error = %error, "X11 cursor composite skipped");
-            }
-        }
-
-        Ok(frame)
+        copy_image_rows(
+            &reply.data,
+            usize::from(self.width),
+            usize::from(self.height),
+            dst,
+        )
     }
 
     /// Alpha-blend the X11 cursor onto a BGRZ frame (mirrors x11grab's
@@ -1377,21 +2876,26 @@ impl X11Grabber {
             .reply()
             .context("read X11 cursor image")?;
 
-        let cursor_width = i32::from(cursor.width);
-        let cursor_height = i32::from(cursor.height);
-        if cursor_width <= 0 || cursor_height <= 0 {
+        if cursor.width == 0 || cursor.height == 0 {
             return Ok(());
         }
-        if cursor.cursor_image.len() != (cursor_width * cursor_height) as usize {
+        if cursor.cursor_image.len() != usize::from(cursor.width) * usize::from(cursor.height) {
             return Ok(());
         }
 
-        // Top-left of the cursor image in capture-region coordinates.
-        let origin_x = i32::from(cursor.x) - i32::from(cursor.xhot) - i32::from(self.x);
-        let origin_y = i32::from(cursor.y) - i32::from(cursor.yhot) - i32::from(self.y);
+        let scale_x = f64::from(frame.width()) / f64::from(self.width);
+        let scale_y = f64::from(frame.height()) / f64::from(self.height);
+        let cursor_width = (f64::from(cursor.width) * scale_x).ceil() as i32;
+        let cursor_height = (f64::from(cursor.height) * scale_y).ceil() as i32;
+        let origin_x = ((f64::from(cursor.x) - f64::from(cursor.xhot) - f64::from(self.x))
+            * scale_x)
+            .floor() as i32;
+        let origin_y = ((f64::from(cursor.y) - f64::from(cursor.yhot) - f64::from(self.y))
+            * scale_y)
+            .floor() as i32;
 
-        let frame_width = i32::from(self.width);
-        let frame_height = i32::from(self.height);
+        let frame_width = frame.width() as i32;
+        let frame_height = frame.height() as i32;
         let stride = frame.stride(0);
         let buf = frame.data_mut(0);
 
@@ -1405,7 +2909,11 @@ impl X11Grabber {
                 if fx < 0 || fx >= frame_width {
                     continue;
                 }
-                let pixel = cursor.cursor_image[(cy * cursor_width + cx) as usize];
+                let source_x =
+                    ((f64::from(cx) / scale_x) as usize).min(usize::from(cursor.width) - 1);
+                let source_y =
+                    ((f64::from(cy) / scale_y) as usize).min(usize::from(cursor.height) - 1);
+                let pixel = cursor.cursor_image[source_y * usize::from(cursor.width) + source_x];
                 let alpha = (pixel >> 24) & 0xff;
                 if alpha == 0 {
                     continue;
@@ -1423,6 +2931,37 @@ impl X11Grabber {
 
         Ok(())
     }
+}
+
+fn copy_image_rows(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    dst: &mut ffmpeg::frame::Video,
+) -> anyhow::Result<()> {
+    let row_bytes = width * 4;
+    let source_stride = data
+        .len()
+        .checked_div(height)
+        .filter(|stride| *stride >= row_bytes)
+        .ok_or_else(|| {
+            anyhow!(
+                "X11 image too small: {} bytes for {}x{}",
+                data.len(),
+                width,
+                height
+            )
+        })?;
+
+    let dst_stride = dst.stride(0);
+    let copy = row_bytes.min(dst_stride);
+    let dst_data = dst.data_mut(0);
+    for row in 0..height {
+        let src_start = row * source_stride;
+        let dst_start = row * dst_stride;
+        dst_data[dst_start..dst_start + copy].copy_from_slice(&data[src_start..src_start + copy]);
+    }
+    Ok(())
 }
 
 /// Map an X11 32-bit TrueColor visual (byte order + RGB masks) to the matching
@@ -1468,4 +3007,721 @@ fn x11_source_pixel(
         (3, 2, 1) => ffmpeg::format::Pixel::ZRGB,
         _ => bail!("Unsupported X11 channel order: b={blue} g={green} r={red}"),
     })
+}
+
+#[cfg(test)]
+mod system_audio_tests {
+    use super::{
+        OwnedSystemAudioFeed, PactlSourceOutput, PulseInputRole, newly_created_source_output,
+        pactl_monitor_preference, pactl_source_index, preferred_system_audio_device,
+        previous_source_destination, process_source_output_ids, pulse_input_route_destination,
+        retry_system_audio_connection, source_output_needs_move, source_output_route_matches,
+        started_input_source_output, uses_default_pulse_input, wait_for_audio_after_route,
+        wait_for_started_source_output,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn cancelled_system_route_does_not_probe_or_publish_a_stream() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let observed = std::sync::atomic::AtomicBool::new(true);
+        let result = wait_for_started_source_output(&[], &observed, &cancel, || {
+            panic!("cancelled route must not inspect Pulse")
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn system_audio_reconnect_selects_output_monitor_instead_of_default_microphone() {
+        let sources = "1\tmicrophone\n2\tother.monitor\n3\tspeakers.monitor\n";
+        assert_eq!(
+            pulse_input_route_destination(
+                sources,
+                PulseInputRole::SystemAudio,
+                Some("microphone"),
+                Some("speakers")
+            ),
+            Some((3, "speakers.monitor".to_string()))
+        );
+    }
+
+    #[test]
+    fn microphone_reconnect_retains_default_microphone_instead_of_output_monitor() {
+        let sources = "1\tmicrophone\n2\tspeakers.monitor\n";
+        assert_eq!(
+            pulse_input_route_destination(
+                sources,
+                PulseInputRole::Microphone,
+                Some("microphone"),
+                Some("speakers")
+            ),
+            Some((1, "microphone".to_string()))
+        );
+    }
+
+    #[test]
+    fn system_audio_reconnect_does_not_fall_back_to_a_microphone() {
+        assert_eq!(
+            pulse_input_route_destination(
+                "1\tmicrophone\n",
+                PulseInputRole::SystemAudio,
+                Some("microphone"),
+                Some("speakers")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn system_audio_reconnect_follows_the_current_default_output() {
+        let sources = "1\tmicrophone\n2\told.monitor\n3\tnew.monitor\n";
+        assert_eq!(
+            pulse_input_route_destination(
+                sources,
+                PulseInputRole::SystemAudio,
+                Some("microphone"),
+                Some("new")
+            ),
+            Some((3, "new.monitor".to_string()))
+        );
+    }
+    use crate::feeds::microphone::MicrophoneFeed;
+    use cap_timestamp::{Timestamp, Timestamps};
+    use kameo::Actor as _;
+    use std::{
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn ambiguous_loopback_waits_for_verified_pulse_monitor() {
+        let devices = ["Loopback", "pulse", "default"].map(str::to_string);
+
+        assert_eq!(preferred_system_audio_device(&devices, false), None);
+        assert_eq!(
+            preferred_system_audio_device(&devices, true),
+            Some("Loopback")
+        );
+    }
+
+    #[test]
+    fn explicit_monitor_and_stereo_mix_remain_direct_inputs() {
+        let devices = ["Loopback", "Stereo Mix", "Output Monitor"].map(str::to_string);
+
+        assert_eq!(
+            preferred_system_audio_device(&devices, false),
+            Some("Output Monitor")
+        );
+
+        let devices = ["Loopback", "Stereo Mix"].map(str::to_string);
+
+        assert_eq!(
+            preferred_system_audio_device(&devices, false),
+            Some("Stereo Mix")
+        );
+    }
+
+    #[test]
+    fn default_sink_monitor_precedes_other_monitor_sources() {
+        let default =
+            pactl_monitor_preference("cap_validation_sink.monitor", Some("cap_validation_sink"));
+        let suspended = pactl_monitor_preference(
+            "alsa_output.platform-snd_aloop.monitor",
+            Some("cap_validation_sink"),
+        );
+
+        assert_eq!(default, Some((0, 0)));
+        assert_eq!(suspended, Some((1, 0)));
+        assert!(default < suspended);
+        assert_eq!(
+            pactl_monitor_preference("cap_validation_sink.monitor", None),
+            Some((1, 0))
+        );
+    }
+
+    #[test]
+    fn source_outputs_only_include_the_current_process() {
+        let outputs = serde_json::json!([
+            { "index": 11, "source": 5, "properties": { "application.process.id": "41" } },
+            { "index": 12, "source": 6, "properties": { "application.process.id": "42" } },
+            { "index": 13, "source": 7, "properties": { "application.process.id": "42" } }
+        ]);
+
+        assert_eq!(
+            process_source_output_ids(outputs.as_array().unwrap(), "42").unwrap(),
+            vec![
+                PactlSourceOutput { id: 12, source: 6 },
+                PactlSourceOutput { id: 13, source: 7 }
+            ]
+        );
+    }
+
+    #[test]
+    fn only_one_new_system_audio_stream_is_accepted() {
+        let previous = [PactlSourceOutput { id: 11, source: 3 }];
+        let current = [
+            PactlSourceOutput { id: 11, source: 2 },
+            PactlSourceOutput { id: 12, source: 2 },
+        ];
+
+        assert_eq!(
+            newly_created_source_output(&previous, &current).unwrap(),
+            12
+        );
+        assert!(newly_created_source_output(&previous, &previous).is_err());
+
+        let ambiguous = [
+            PactlSourceOutput { id: 11, source: 2 },
+            PactlSourceOutput { id: 12, source: 2 },
+            PactlSourceOutput { id: 13, source: 2 },
+        ];
+
+        assert!(newly_created_source_output(&previous, &ambiguous).is_err());
+    }
+
+    #[test]
+    fn default_input_waits_for_capture_instead_of_selecting_a_probe_stream() {
+        let previous = [PactlSourceOutput { id: 11, source: 3 }];
+        let probing = [
+            PactlSourceOutput { id: 11, source: 3 },
+            PactlSourceOutput { id: 12, source: 3 },
+        ];
+        let capturing = [
+            PactlSourceOutput { id: 11, source: 3 },
+            PactlSourceOutput { id: 13, source: 2 },
+        ];
+
+        assert_eq!(
+            started_input_source_output(&previous, &probing, false).unwrap(),
+            None
+        );
+        assert_eq!(
+            started_input_source_output(&previous, &capturing, true).unwrap(),
+            Some(13)
+        );
+        assert_eq!(
+            started_input_source_output(&previous, &previous, true).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn pulse_input_accepts_a_buffered_first_callback() {
+        let observed = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let callback = scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(650));
+                observed.store(true, Ordering::Release);
+            });
+            let output =
+                wait_for_started_source_output(&[], &observed, &CancellationToken::new(), || {
+                    Ok(vec![PactlSourceOutput { id: 12, source: 3 }])
+                });
+            callback.join().unwrap();
+            assert_eq!(output.unwrap(), PactlSourceOutput { id: 12, source: 3 });
+        });
+    }
+
+    #[tokio::test]
+    async fn system_audio_retries_initial_input_connection_failures() {
+        let attempts = AtomicUsize::new(0);
+        let closed = AtomicUsize::new(0);
+        let input = retry_system_audio_connection(
+            || {
+                let attempt = attempts.fetch_add(1, Ordering::Relaxed);
+                assert_eq!(closed.load(Ordering::Relaxed), attempt);
+                std::future::ready(if attempt == 0 {
+                    Err(anyhow::anyhow!("Default input route was not applied"))
+                } else {
+                    Ok(42)
+                })
+            },
+            || {
+                closed.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(Ok(()))
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(input, 42);
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(closed.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn system_audio_connection_retries_are_bounded_and_close_the_final_input() {
+        let attempts = AtomicUsize::new(0);
+        let closed = AtomicUsize::new(0);
+        let result = retry_system_audio_connection(
+            || {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(Err::<(), _>(anyhow::anyhow!("Input route was not applied")))
+            },
+            || {
+                closed.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(Ok(()))
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+        assert_eq!(closed.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn system_audio_does_not_reconnect_when_the_previous_input_cannot_close() {
+        let attempts = AtomicUsize::new(0);
+        let result = retry_system_audio_connection(
+            || {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                std::future::ready(Err::<(), _>(anyhow::anyhow!("Input route was not applied")))
+            },
+            || std::future::ready(Err(anyhow::anyhow!("Input is still locked"))),
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err().to_string(), "Input is still locked");
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn system_audio_waits_for_samples_captured_after_the_route_change() {
+        let routed_at = Timestamps::now();
+        let (sender, receiver) = flume::bounded(2);
+        sender
+            .send(Timestamp::Instant(
+                routed_at
+                    .instant()
+                    .checked_sub(Duration::from_millis(100))
+                    .unwrap(),
+            ))
+            .unwrap();
+        let ready = wait_for_audio_after_route(receiver.stream(), routed_at);
+        tokio::pin!(ready);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut ready)
+                .await
+                .is_err()
+        );
+        sender.send(Timestamp::Instant(Instant::now())).unwrap();
+        ready.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn system_audio_readiness_rejects_a_closed_input() {
+        let result = wait_for_audio_after_route(futures::stream::empty(), Timestamps::now()).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn system_audio_releases_its_feed_even_when_other_references_remain() {
+        let (error_tx, _error_rx) = flume::bounded(1);
+        let feed = MicrophoneFeed::spawn(MicrophoneFeed::new(error_tx));
+        feed.wait_for_startup().await;
+        assert!(feed.is_alive());
+
+        let owned = OwnedSystemAudioFeed {
+            actor: feed.clone(),
+            build_scope: None,
+            stopped: false,
+        };
+        drop(owned);
+
+        tokio::time::timeout(Duration::from_secs(1), feed.wait_for_stop())
+            .await
+            .unwrap();
+        assert!(!feed.is_alive());
+    }
+
+    #[tokio::test]
+    async fn failed_resume_scope_joins_its_private_system_audio_actor_shutdown() {
+        let (error_tx, _error_rx) = flume::bounded(1);
+        let feed = MicrophoneFeed::spawn(MicrophoneFeed::new(error_tx));
+        feed.wait_for_startup().await;
+        let scope = crate::output_pipeline::PipelineBuildScope::new();
+        let owned = scope
+            .run(async {
+                OwnedSystemAudioFeed {
+                    actor: feed.clone(),
+                    build_scope: crate::output_pipeline::PipelineBuildScope::current(),
+                    stopped: false,
+                }
+            })
+            .await;
+        drop(owned);
+        tokio::time::timeout(Duration::from_secs(1), scope.cancel_and_join())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!feed.is_alive());
+    }
+
+    #[test]
+    fn remembered_monitor_input_returns_to_selected_microphone() {
+        assert_eq!(
+            previous_source_destination(2, 2, "desktop.monitor", Some("microphone.monitor")),
+            "microphone.monitor"
+        );
+        assert_eq!(
+            previous_source_destination(7, 2, "desktop.monitor", Some("microphone.monitor")),
+            "7"
+        );
+        assert_eq!(
+            previous_source_destination(2, 2, "desktop.monitor", Some("desktop.monitor")),
+            "2"
+        );
+        assert_eq!(
+            previous_source_destination(2, 2, "desktop.monitor", None),
+            "2"
+        );
+    }
+
+    #[test]
+    fn correctly_routed_streams_are_not_interrupted() {
+        assert!(!source_output_needs_move(2, Some(2)));
+        assert!(source_output_needs_move(2, Some(3)));
+        assert!(source_output_needs_move(2, None));
+
+        let sources = "2 desktop.monitor module-null-sink\n3 microphone.monitor module-null-sink";
+        assert_eq!(pactl_source_index(sources, "microphone.monitor"), Some(3));
+        assert_eq!(pactl_source_index(sources, "missing.monitor"), None);
+    }
+
+    #[test]
+    fn routing_acknowledgement_requires_the_requested_source() {
+        let unchanged = [PactlSourceOutput {
+            id: 1128,
+            source: 61,
+        }];
+        let routed = [PactlSourceOutput {
+            id: 1128,
+            source: 47,
+        }];
+
+        assert!(!source_output_route_matches(&unchanged, 1128, 47).unwrap());
+        assert!(source_output_route_matches(&routed, 1128, 47).unwrap());
+        assert!(source_output_route_matches(&[], 1128, 47).is_err());
+        assert!(source_output_route_matches(&routed, 1129, 47).is_err());
+    }
+
+    #[test]
+    fn only_generic_pulse_devices_follow_the_default_input() {
+        assert!(uses_default_pulse_input("default"));
+        assert!(uses_default_pulse_input("PULSE"));
+        assert!(!uses_default_pulse_input("USB Microphone"));
+        assert!(!uses_default_pulse_input("desktop.monitor"));
+        assert!(!uses_default_pulse_input("hw:1,0"));
+        assert!(!uses_default_pulse_input("pipewire"));
+    }
+}
+
+#[cfg(test)]
+mod pipewire_frame_tests {
+    use super::{
+        FrameScaler, LinuxCaptureSource, PipewireNodeInput, VideoInfo, capture_pipewire_node,
+        frame_from_pipewire_data, pipewire_dmabuf_format_param, pipewire_format_param,
+        prefers_wayland_environment, prepare_pipewire_frame, spa, wayland_area_matches_display,
+        wayland_video_info,
+    };
+    use std::os::fd::AsRawFd;
+
+    /// GitHub #2941: niri 26.04 shares screencasts only as DMA-BUFs with a
+    /// mandatory modifier, which 0.6.1 never offered, so nothing was ever
+    /// captured. This records from a producer that negotiates and shares
+    /// frames the way niri does (scripts/linux-desktop-harness/niri-screencast)
+    /// through Cap's real PipeWire capture loop.
+    #[test]
+    #[ignore = "needs a PipeWire daemon and CAP_FAKE_NIRI_PRODUCER"]
+    fn frames_from_a_producer_that_shares_only_dmabufs_are_captured() {
+        use std::io::BufRead;
+
+        let producer = std::env::var("CAP_FAKE_NIRI_PRODUCER")
+            .expect("set CAP_FAKE_NIRI_PRODUCER to the built producer");
+        let mut child = std::process::Command::new(producer)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        struct Kill(std::process::Child);
+        impl Drop for Kill {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let stdout = child.stdout.take().unwrap();
+        let child = Kill(child);
+        let (node_tx, node_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                if let Some(node) = line.strip_prefix("node ") {
+                    let _ = node_tx.send(node.trim().parse::<u32>().unwrap());
+                }
+            }
+        });
+        let node_id = node_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the producer announced no node");
+
+        let runtime = std::env::var("PIPEWIRE_RUNTIME_DIR")
+            .or_else(|_| std::env::var("XDG_RUNTIME_DIR"))
+            .unwrap();
+        let socket =
+            std::os::unix::net::UnixStream::connect(format!("{runtime}/pipewire-0")).unwrap();
+        let (video_tx, mut video_rx) = futures::channel::mpsc::channel(4);
+        let (health_tx, _health_rx) = tokio::sync::mpsc::channel(16);
+        let stop = tokio_util::sync::CancellationToken::new();
+        let capture = std::thread::spawn({
+            let stop = stop.clone();
+            move || {
+                capture_pipewire_node(
+                    VideoInfo::from_raw_ffmpeg(ffmpeg::format::Pixel::BGRZ, 640, 360, 30),
+                    PipewireNodeInput {
+                        fd: socket.into(),
+                        node_id,
+                        fps: 30,
+                        crop_bounds: None,
+                    },
+                    video_tx,
+                    stop,
+                    health_tx,
+                )
+            }
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut frames = Vec::new();
+        loop {
+            if frames.len() >= 10 || std::time::Instant::now() >= deadline || capture.is_finished()
+            {
+                break;
+            }
+            match video_rx.try_next() {
+                Ok(Some(frame)) => frames.push(frame.inner),
+                Ok(None) => break,
+                Err(_) => std::thread::park_timeout(std::time::Duration::from_millis(10)),
+            }
+        }
+        stop.cancel();
+        let result = capture.join().unwrap();
+        drop(child);
+        assert!(
+            frames.len() >= 10,
+            "captured {} frames; capture ended with {result:?}",
+            frames.len()
+        );
+        result.unwrap();
+        let mut levels = std::collections::BTreeSet::new();
+        for frame in &frames {
+            assert_eq!((frame.width(), frame.height()), (640, 360));
+            let pixel = &frame.data(0)[..4];
+            assert_eq!(&pixel[1..3], &[0x40, 0x80], "{pixel:?}");
+            levels.insert(pixel[0]);
+        }
+        assert!(
+            levels.len() > 1,
+            "every captured frame was the same picture"
+        );
+    }
+
+    /// niri 26.04 shares only DMA-BUFs: the buffer is not mapped for the
+    /// consumer, `maxsize` is 1 and the chunk carries just stride and offset.
+    /// 0.6.1 rejected every such frame ("buffer was not memory-mapped").
+    #[test]
+    fn an_unmapped_dmabuf_frame_is_read_from_its_file_descriptor() {
+        let (width, height, stride) = (4usize, 3usize, 24usize);
+        let mut bytes = vec![0u8; stride * height];
+        for y in 0..height {
+            for x in 0..width {
+                let pixel = &mut bytes[y * stride + x * 4..][..4];
+                pixel.copy_from_slice(&[x as u8, y as u8, 0x80, 0xff]);
+            }
+        }
+        let file = tempfile::tempfile().unwrap();
+        std::io::Write::write_all(&mut &file, &bytes).unwrap();
+
+        let mut chunk = spa::sys::spa_chunk {
+            offset: 0,
+            size: 0,
+            stride: stride as i32,
+            flags: 0,
+        };
+        let mut raw: spa::sys::spa_data = unsafe { std::mem::zeroed() };
+        raw.type_ = spa::sys::SPA_DATA_DmaBuf;
+        raw.flags = spa::sys::SPA_DATA_FLAG_READWRITE;
+        raw.fd = i64::from(file.as_raw_fd());
+        raw.maxsize = 1;
+        raw.data = std::ptr::null_mut();
+        raw.chunk = &mut chunk;
+        let data = unsafe { &mut *(&mut raw as *mut spa::sys::spa_data as *mut spa::buffer::Data) };
+
+        let mut format = spa::param::video::VideoInfoRaw::new();
+        format.set_format(spa::param::video::VideoFormat::BGRx);
+        format.set_size(spa::utils::Rectangle {
+            width: width as u32,
+            height: height as u32,
+        });
+        format.set_modifier(0);
+        let frame = frame_from_pipewire_data(data, format, None)
+            .unwrap()
+            .expect("a frame");
+        assert_eq!((frame.width(), frame.height()), (4, 3));
+        assert_eq!(frame.format(), ffmpeg::format::Pixel::BGRZ);
+        for y in 0..height {
+            let row = &frame.data(0)[y * frame.stride(0)..][..width * 4];
+            assert_eq!(row, &bytes[y * stride..][..width * 4], "row {y}");
+        }
+    }
+
+    #[test]
+    fn dmabuf_offer_follows_shared_memory_with_a_mandatory_linear_modifier() {
+        let shm = pipewire_format_param(30).unwrap();
+        let shm = spa::pod::Pod::from_bytes(&shm)
+            .unwrap()
+            .as_object()
+            .unwrap();
+        let modifier = spa::utils::Id(spa::param::format::FormatProperties::VideoModifier.0);
+        assert!(shm.find_prop(modifier).is_none());
+
+        let bytes = pipewire_dmabuf_format_param(30).unwrap();
+        let object = spa::pod::Pod::from_bytes(&bytes)
+            .unwrap()
+            .as_object()
+            .unwrap();
+        let prop = object.find_prop(modifier).expect("a modifier property");
+        assert!(prop.flags().contains(spa::pod::PodPropFlags::MANDATORY));
+        let (_, value) = spa::pod::deserialize::PodDeserializer::deserialize_from::<
+            spa::utils::Choice<i64>,
+        >(prop.value().as_bytes())
+        .unwrap();
+        let spa::utils::ChoiceEnum::Enum { alternatives, .. } = value.1 else {
+            panic!("modifier is not an enum choice");
+        };
+        assert_eq!(alternatives, vec![0]);
+    }
+
+    #[test]
+    fn wayland_area_requires_the_selected_monitor_in_the_portal() {
+        use scap_targets::bounds::{LogicalBounds, LogicalPosition, LogicalSize};
+
+        let selected = LogicalBounds::new(
+            LogicalPosition::new(960.0, 0.0),
+            LogicalSize::new(960.0, 540.0),
+        );
+        assert!(wayland_area_matches_display(
+            Some((960, 0)),
+            Some((960, 540)),
+            selected,
+            false,
+        ));
+        assert!(!wayland_area_matches_display(
+            Some((0, 0)),
+            Some((960, 540)),
+            selected,
+            false,
+        ));
+        assert!(!wayland_area_matches_display(
+            None,
+            Some((960, 540)),
+            selected,
+            false,
+        ));
+        assert!(!wayland_area_matches_display(
+            Some((960, 0)),
+            Some((1920, 1080)),
+            selected,
+            false,
+        ));
+        assert!(wayland_area_matches_display(None, None, selected, true));
+    }
+
+    #[test]
+    fn portal_logical_size_does_not_reduce_physical_monitor_capture() {
+        let output = VideoInfo::from_raw_ffmpeg(ffmpeg::format::Pixel::BGRZ, 1920, 1080, 60);
+        let result = wayland_video_info(Some((960, 540)), output, &LinuxCaptureSource::Display);
+        assert_eq!((result.width, result.height), (1920, 1080));
+    }
+
+    #[test]
+    fn portal_size_does_not_override_capture_limits_or_area_dimensions() {
+        for (source, width, height) in [
+            (LinuxCaptureSource::Display, 1280, 720),
+            (LinuxCaptureSource::Area, 800, 400),
+        ] {
+            let output = VideoInfo::from_raw_ffmpeg(ffmpeg::format::Pixel::BGRZ, width, height, 60);
+            let result = wayland_video_info(Some((1920, 1080)), output, &source);
+            assert_eq!((result.width, result.height), (width, height));
+        }
+    }
+
+    #[test]
+    fn portal_window_capture_keeps_its_selected_surface_dimensions() {
+        let output = VideoInfo::from_raw_ffmpeg(ffmpeg::format::Pixel::BGRZ, 1920, 1080, 60);
+        let source = LinuxCaptureSource::Window {
+            id: "0".parse().unwrap(),
+        };
+        let result = wayland_video_info(Some((641, 481)), output, &source);
+        assert_eq!((result.width, result.height), (640, 480));
+        let result = wayland_video_info(None, output, &source);
+        assert_eq!((result.width, result.height), (1920, 1080));
+    }
+
+    #[test]
+    fn active_wayland_sessions_use_the_portal_even_with_xwayland() {
+        assert!(prefers_wayland_environment(true, false, None));
+        assert!(prefers_wayland_environment(true, true, Some("wayland")));
+        assert!(prefers_wayland_environment(true, true, Some("Wayland")));
+        assert!(!prefers_wayland_environment(true, true, Some("x11")));
+        assert!(!prefers_wayland_environment(true, true, None));
+        assert!(!prefers_wayland_environment(false, true, Some("wayland")));
+    }
+
+    #[test]
+    fn matching_pipewire_frames_reuse_owned_pixel_storage_without_a_scaler() {
+        let mut frame = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::BGRZ, 16, 12);
+        frame.set_pts(Some(73));
+        let source = frame.data(0).as_ptr();
+        let output = VideoInfo::from_raw_ffmpeg(ffmpeg::format::Pixel::BGRZ, 16, 12, 60);
+        let mut scaler: Option<FrameScaler> = None;
+
+        let prepared = prepare_pipewire_frame(frame, &mut scaler, output).unwrap();
+
+        assert_eq!(prepared.data(0).as_ptr(), source);
+        assert_eq!(prepared.format(), ffmpeg::format::Pixel::BGRZ);
+        assert_eq!(prepared.pts(), Some(73));
+        assert!(scaler.is_none());
+    }
+
+    #[test]
+    fn mismatched_pipewire_pixel_formats_are_converted() {
+        let mut frame = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::RGBZ, 16, 12);
+        frame.set_pts(Some(31));
+        let output = VideoInfo::from_raw_ffmpeg(ffmpeg::format::Pixel::BGRZ, 16, 12, 60);
+        let mut scaler: Option<FrameScaler> = None;
+
+        let prepared = prepare_pipewire_frame(frame, &mut scaler, output).unwrap();
+
+        assert_eq!(prepared.format(), ffmpeg::format::Pixel::BGRZ);
+        assert_eq!((prepared.width(), prepared.height()), (16, 12));
+        assert_eq!(prepared.pts(), Some(31));
+        assert!(scaler.is_some());
+    }
+
+    #[test]
+    fn mismatched_pipewire_dimensions_are_scaled() {
+        let frame = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::BGRZ, 16, 12);
+        let output = VideoInfo::from_raw_ffmpeg(ffmpeg::format::Pixel::BGRZ, 8, 6, 60);
+        let mut scaler: Option<FrameScaler> = None;
+
+        let prepared = prepare_pipewire_frame(frame, &mut scaler, output).unwrap();
+
+        assert_eq!(prepared.format(), ffmpeg::format::Pixel::BGRZ);
+        assert_eq!((prepared.width(), prepared.height()), (8, 6));
+        assert!(scaler.is_some());
+    }
 }

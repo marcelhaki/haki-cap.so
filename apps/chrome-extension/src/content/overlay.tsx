@@ -15,6 +15,7 @@ import {
 	useState,
 } from "react";
 import { createRoot } from "react-dom/client";
+import { connectCameraPreview } from "../shared/camera-preview-connection";
 import { isOverlayMessage } from "../shared/messages";
 import { sendServiceWorkerMessage } from "../shared/runtime";
 import {
@@ -43,10 +44,6 @@ import type {
 	WebcamSettings,
 	WebcamShape,
 } from "../shared/types";
-import {
-	toSessionDescriptionInit,
-	waitForIceGatheringComplete,
-} from "../shared/webrtc";
 import { ConfirmOverlay } from "./confirm-overlay";
 import { CountdownOverlay } from "./countdown-overlay";
 import overlayCss from "./overlay.css?inline";
@@ -91,10 +88,12 @@ const FRAME_PERSIST_INTERVAL_MS = 5000;
 // so the service worker only honours requests from frames whose URL-hash
 // token was registered by this content script. Registration must complete
 // before an iframe is rendered, otherwise its first camera connect races the
-// registry write.
+// registry write. The registry keeps only the most recently registered
+// tokens, so frames register again each time they mount instead of trusting
+// an old registration that other tabs may have pushed out.
 let overlayTokensRegistration: Promise<boolean> | null = null;
 
-const ensureOverlayTokensRegistered = () => {
+const registerOverlayTokens = () => {
 	overlayTokensRegistration ??= Promise.all(
 		[PREVIEW_TOKEN, PANEL_TOKEN].map((token) =>
 			sendServiceWorkerMessage({
@@ -104,16 +103,10 @@ const ensureOverlayTokensRegistered = () => {
 			}),
 		),
 	)
-		.then((responses) => {
-			const registered = responses.every((response) => response.ok);
-			if (!registered) {
-				overlayTokensRegistration = null;
-			}
-			return registered;
-		})
-		.catch(() => {
+		.then((responses) => responses.every((response) => response.ok))
+		.catch(() => false)
+		.finally(() => {
 			overlayTokensRegistration = null;
-			return false;
 		});
 	return overlayTokensRegistration;
 };
@@ -263,78 +256,11 @@ const isSameWebcamSettings = (
 	current.shape === next.shape &&
 	current.mirror === next.mirror;
 
-const waitForRemoteStream = (peer: RTCPeerConnection) =>
-	new Promise<MediaStream>((resolve, reject) => {
-		let settled = false;
-		const timeout = window.setTimeout(() => {
-			if (settled) return;
-			settled = true;
-			reject(new Error("Camera preview timed out."));
-		}, 10000);
-
-		const finish = (stream: MediaStream) => {
-			if (settled) return;
-			settled = true;
-			window.clearTimeout(timeout);
-			resolve(stream);
-		};
-
-		peer.addEventListener("track", (event) => {
-			finish(event.streams[0] ?? new MediaStream([event.track]));
-		});
-
-		peer.addEventListener("connectionstatechange", () => {
-			if (
-				settled ||
-				(peer.connectionState !== "failed" && peer.connectionState !== "closed")
-			) {
-				return;
-			}
-			settled = true;
-			window.clearTimeout(timeout);
-			reject(new Error("Camera preview connection failed."));
-		});
-	});
-
 const stopStream = (stream: MediaStream | null) => {
 	if (!stream) return;
 	for (const track of stream.getTracks()) {
 		track.stop();
 	}
-};
-
-const connectCameraPreview = async (
-	settings: WebcamSettings,
-	sessionId: string,
-) => {
-	const peer = new RTCPeerConnection();
-	peer.addTransceiver("video", { direction: "recvonly" });
-	const remoteStreamPromise = waitForRemoteStream(peer);
-	await peer.setLocalDescription(await peer.createOffer());
-	await waitForIceGatheringComplete(peer);
-
-	const response = await sendServiceWorkerMessage({
-		target: "service-worker",
-		type: "connect-camera-preview",
-		sessionId,
-		settings,
-		offer: toSessionDescriptionInit(peer.localDescription),
-	});
-
-	if (!response.ok) {
-		peer.close();
-		throw new Error(response.error);
-	}
-	if (!response.answer) {
-		peer.close();
-		throw new Error("Camera preview did not return an answer.");
-	}
-
-	await peer.setRemoteDescription(response.answer);
-	return {
-		peer,
-		stream: await remoteStreamPromise,
-	};
 };
 
 type PanelFrameMessage =
@@ -368,13 +294,12 @@ const isPanelFrameMessage = (value: unknown): value is PanelFrameMessage => {
 };
 
 function RecorderPanelOverlay({
-	onDismiss,
-	onOpenChange,
+	open,
+	onClose,
 }: {
-	onDismiss: () => void;
-	onOpenChange: (open: boolean) => void;
+	open: boolean;
+	onClose: () => void;
 }) {
-	const [open, setOpen] = useState(false);
 	const [pageVisible, setPageVisible] = useState(
 		() => document.visibilityState === "visible",
 	);
@@ -383,52 +308,22 @@ function RecorderPanelOverlay({
 		() => window.innerHeight,
 	);
 	const [tokenReady, setTokenReady] = useState(false);
-	const startupReplayedRef = useRef(false);
+	const shown = open && pageVisible;
 
+	// Hidden tabs never mount the panel, so only register when it is shown.
 	useEffect(() => {
-		onOpenChange(open);
-	}, [onOpenChange, open]);
-
-	useEffect(() => {
-		if (!open || tokenReady) return;
+		if (!shown) {
+			setTokenReady(false);
+			return;
+		}
 		let disposed = false;
-		void ensureOverlayTokensRegistered().then((registered) => {
+		void registerOverlayTokens().then((registered) => {
 			if (!disposed && registered) setTokenReady(true);
 		});
 		return () => {
 			disposed = true;
 		};
-	}, [open, tokenReady]);
-
-	// The open flag lives in chrome.storage.session so the panel follows the
-	// user across tabs: opening or closing it anywhere applies everywhere.
-	useEffect(() => {
-		let disposed = false;
-
-		const syncPanelState = () => {
-			loadSharedUiState()
-				.then((state) => {
-					if (!disposed) setOpen(state.panelOpen);
-				})
-				.catch(() => undefined);
-		};
-
-		const handleStorageChange = (
-			changes: Record<string, chrome.storage.StorageChange>,
-			areaName: string,
-		) => {
-			if (areaName === "session" && changes[SHARED_UI_STATE_KEY]) {
-				syncPanelState();
-			}
-		};
-
-		syncPanelState();
-		chrome.storage.onChanged.addListener(handleStorageChange);
-		return () => {
-			disposed = true;
-			chrome.storage.onChanged.removeListener(handleStorageChange);
-		};
-	}, []);
+	}, [shown]);
 
 	useEffect(() => {
 		const handleVisibility = () =>
@@ -438,55 +333,6 @@ function RecorderPanelOverlay({
 			document.removeEventListener("visibilitychange", handleVisibility);
 	}, []);
 
-	const closePanel = useCallback(() => {
-		setOpen(false);
-		onDismiss();
-		void updateSharedUiState((current) => ({
-			...current,
-			panelOpen: false,
-			updatedAt: Date.now(),
-		})).catch(() => undefined);
-	}, [onDismiss]);
-
-	useEffect(() => {
-		const handleMessage = (
-			message: unknown,
-			_sender: chrome.runtime.MessageSender,
-			sendResponse: (response?: unknown) => void,
-		) => {
-			if (!isOverlayMessage(message)) return false;
-			if (message.type === "overlay-panel-toggle") {
-				sendResponse({ ok: true });
-				// Flip the shared flag; every tab (this one included) follows the
-				// storage change. Reopening also resurfaces a dismissed ready bar.
-				void updateSharedUiState((current) => ({
-					...current,
-					panelOpen: !current.panelOpen,
-					readyBarDismissed: current.panelOpen
-						? current.readyBarDismissed
-						: false,
-					updatedAt: Date.now(),
-				}))
-					.then((state) => setOpen(state.panelOpen))
-					.catch(() => undefined);
-				return false;
-			}
-			if (message.type === "overlay-panel-hide") {
-				sendResponse({ ok: true });
-				closePanel();
-				return false;
-			}
-			return false;
-		};
-
-		chrome.runtime.onMessage.addListener(handleMessage);
-		if (!startupReplayedRef.current) {
-			startupReplayedRef.current = true;
-			replayStartupMessages(handleMessage);
-		}
-		return () => chrome.runtime.onMessage.removeListener(handleMessage);
-	}, [closePanel]);
-
 	useEffect(() => {
 		const handleFrameMessage = (event: MessageEvent<unknown>) => {
 			if (event.origin !== EXTENSION_ORIGIN) return;
@@ -495,12 +341,12 @@ function RecorderPanelOverlay({
 				setContentHeight(Math.max(320, Math.ceil(event.data.height)));
 				return;
 			}
-			closePanel();
+			onClose();
 		};
 
 		window.addEventListener("message", handleFrameMessage);
 		return () => window.removeEventListener("message", handleFrameMessage);
-	}, [closePanel]);
+	}, [onClose]);
 
 	useEffect(() => {
 		if (!open) return;
@@ -524,7 +370,7 @@ function RecorderPanelOverlay({
 				type="button"
 				className="cap-extension-panel-backdrop"
 				aria-label="Dismiss Cap recorder"
-				onClick={closePanel}
+				onClick={onClose}
 			/>
 			<div
 				className="cap-extension-panel"
@@ -594,13 +440,12 @@ function OverlayApp() {
 	const previewOpenRef = useRef(false);
 	const livePreviewReadyRef = useRef(false);
 	const previewDismissedRef = useRef(false);
+	const previewVisibilityGenerationRef = useRef(0);
 	const lastFrameRef = useRef<WebcamPreviewFrame | null>(null);
 	const lastFrameSavedAtRef = useRef(0);
 	const startupReplayedRef = useRef(false);
 	const webcam = extensionSettings?.webcam ?? null;
-	const previewEnabled = Boolean(
-		webcam?.enabled && webcam.deviceId && previewOpen,
-	);
+	const previewEnabled = Boolean(webcam?.enabled && previewOpen);
 	const isInPictureInPicture = parentPipActive || framePipActive;
 	const parentPipSupported =
 		typeof document !== "undefined" && document.pictureInPictureEnabled;
@@ -685,13 +530,6 @@ function OverlayApp() {
 		postPreviewMessage,
 	]);
 
-	const handleRecorderPanelDismiss = useCallback(() => {
-		void sendServiceWorkerMessage({
-			target: "service-worker",
-			type: "close-extension-ui",
-		}).catch(() => undefined);
-	}, []);
-
 	const applyWebcamSettings = useCallback(
 		(getNext: (current: WebcamSettings) => WebcamSettings) => {
 			setExtensionSettings((current) => {
@@ -764,15 +602,25 @@ function OverlayApp() {
 	// worker knows this page's tokens; an unregistered frame is refused camera
 	// access.
 	useEffect(() => {
-		if (!previewEnabled || previewTokenReady) return;
+		if (!previewEnabled) {
+			setPreviewTokenReady(false);
+			return;
+		}
 		let disposed = false;
-		void ensureOverlayTokensRegistered().then((registered) => {
+		void registerOverlayTokens().then((registered) => {
 			if (!disposed && registered) setPreviewTokenReady(true);
 		});
+		// A live preview keeps using its token, so refresh it whenever the tab
+		// comes back into view.
+		const refresh = () => {
+			if (document.visibilityState === "visible") void registerOverlayTokens();
+		};
+		document.addEventListener("visibilitychange", refresh);
 		return () => {
 			disposed = true;
+			document.removeEventListener("visibilitychange", refresh);
 		};
-	}, [previewEnabled, previewTokenReady]);
+	}, [previewEnabled]);
 
 	useEffect(() => {
 		let disposed = false;
@@ -859,13 +707,46 @@ function OverlayApp() {
 					setRecordingPreviewActive(previewActive);
 					// A replayed startup message (the lazy-load trigger) may have
 					// already opened the preview before this sync resolves, so only
-					// ever turn it on here.
-					if (!dismissed && previewActive) setPreviewOpen(true);
+					// ever turn it on here. Every open tab loads the overlay when a
+					// recording starts; only a visible one opens the camera, and a
+					// background tab picks it up when it is shown.
+					if (
+						!dismissed &&
+						previewActive &&
+						document.visibilityState === "visible"
+					) {
+						setPreviewOpen(true);
+					}
 				}
 			})
 			.catch(() => undefined);
 		return () => {
 			disposed = true;
+		};
+	}, []);
+
+	useEffect(() => {
+		let disposed = false;
+		const syncSharedUi = () => {
+			loadSharedUiState()
+				.then((state) => {
+					if (!disposed) setRecorderPanelOpen(state.panelOpen);
+				})
+				.catch(() => undefined);
+		};
+		syncSharedUi();
+		const handleStorageChange = (
+			changes: Record<string, chrome.storage.StorageChange>,
+			areaName: string,
+		) => {
+			if (areaName === "session" && changes[SHARED_UI_STATE_KEY]) {
+				syncSharedUi();
+			}
+		};
+		chrome.storage.onChanged.addListener(handleStorageChange);
+		return () => {
+			disposed = true;
+			chrome.storage.onChanged.removeListener(handleStorageChange);
 		};
 	}, []);
 
@@ -931,7 +812,33 @@ function OverlayApp() {
 
 			sendResponse({ ok: true });
 
+			if (message.type === "overlay-panel-toggle") {
+				void updateSharedUiState((current) => ({
+					...current,
+					panelOpen: !current.panelOpen,
+					readyBarDismissed: current.panelOpen
+						? current.readyBarDismissed
+						: false,
+					updatedAt: Date.now(),
+				}))
+					.then((state) => setRecorderPanelOpen(state.panelOpen))
+					.catch(() => undefined);
+				return false;
+			}
+
+			if (message.type === "overlay-panel-hide") {
+				void updateSharedUiState((current) => ({
+					...current,
+					panelOpen: false,
+					updatedAt: Date.now(),
+				}))
+					.then((state) => setRecorderPanelOpen(state.panelOpen))
+					.catch(() => undefined);
+				return false;
+			}
+
 			if (message.type === "overlay-hide") {
+				previewVisibilityGenerationRef.current += 1;
 				recordingPreviewActiveRef.current = false;
 				setRecordingPreviewActive(false);
 				stopLocalPreview();
@@ -980,48 +887,61 @@ function OverlayApp() {
 
 			if (message.type !== "overlay-settings") return false;
 
-			if (previewDismissedRef.current) return false;
+			// The service worker clears the dismissed flag right before it pushes
+			// these settings, but this tab only hears about that through an async
+			// storage change. Re-read the flag so a reopened recorder is not
+			// dropped as still dismissed. A hide or newer push that lands while the
+			// read is pending wins.
+			previewVisibilityGenerationRef.current += 1;
+			const generation = previewVisibilityGenerationRef.current;
+			void loadWebcamPreviewDismissed()
+				.catch(() => previewDismissedRef.current)
+				.then((dismissed) => {
+					if (previewVisibilityGenerationRef.current !== generation) return;
+					previewDismissedRef.current = dismissed;
+					if (dismissed) return;
 
-			const webcamSettings = message.settings;
-			const sameLivePreview =
-				previewOpenRef.current &&
-				livePreviewReadyRef.current &&
-				isSameWebcamSettings(webcamRef.current, webcamSettings);
-			if (!sameLivePreview) {
-				setLivePreviewReady(false);
-			} else {
-				// A restarted service worker loses which tab owns the live preview,
-				// so re-announce readiness whenever it pushes the same settings.
-				void sendServiceWorkerMessage({
-					target: "service-worker",
-					type: "webcam-preview-ready",
-				}).catch(() => undefined);
-			}
-			setPreviewError(null);
-			setShowPreviewError(false);
-			setPreviewOpen(true);
-			recordingPreviewActiveRef.current = message.recording;
-			setRecordingPreviewActive(message.recording);
-			if (settingsRef.current) {
-				setExtensionSettings({
-					...settingsRef.current,
-					webcam: webcamSettings,
+					const webcamSettings = message.settings;
+					const sameLivePreview =
+						previewOpenRef.current &&
+						livePreviewReadyRef.current &&
+						isSameWebcamSettings(webcamRef.current, webcamSettings);
+					if (!sameLivePreview) {
+						setLivePreviewReady(false);
+					} else {
+						// A restarted service worker loses which tab owns the live preview,
+						// so re-announce readiness whenever it pushes the same settings.
+						void sendServiceWorkerMessage({
+							target: "service-worker",
+							type: "webcam-preview-ready",
+						}).catch(() => undefined);
+					}
+					setPreviewError(null);
+					setShowPreviewError(false);
+					setPreviewOpen(true);
+					recordingPreviewActiveRef.current = message.recording;
+					setRecordingPreviewActive(message.recording);
+					if (settingsRef.current) {
+						setExtensionSettings({
+							...settingsRef.current,
+							webcam: webcamSettings,
+						});
+					} else {
+						sendServiceWorkerMessage({
+							target: "service-worker",
+							type: "get-overlay-settings",
+						})
+							.then((response) => {
+								if (response.ok && response.settings) {
+									setExtensionSettings({
+										...response.settings,
+										webcam: webcamSettings,
+									});
+								}
+							})
+							.catch(() => undefined);
+					}
 				});
-			} else {
-				sendServiceWorkerMessage({
-					target: "service-worker",
-					type: "get-overlay-settings",
-				})
-					.then((response) => {
-						if (response.ok && response.settings) {
-							setExtensionSettings({
-								...response.settings,
-								webcam: webcamSettings,
-							});
-						}
-					})
-					.catch(() => undefined);
-			}
 			return false;
 		};
 
@@ -1599,6 +1519,7 @@ function OverlayApp() {
 	}, [endDrag, handlePointerMove, isDragging]);
 
 	const handleClose = useCallback(() => {
+		previewVisibilityGenerationRef.current += 1;
 		previewDismissedRef.current = true;
 		stopLocalPreview();
 		setRecordingPreviewActive(false);
@@ -1633,6 +1554,19 @@ function OverlayApp() {
 			mirror: !current.mirror,
 		}));
 	}, [applyWebcamSettings]);
+
+	const closeRecorderPanel = useCallback(() => {
+		setRecorderPanelOpen(false);
+		void sendServiceWorkerMessage({
+			target: "service-worker",
+			type: "close-extension-ui",
+		}).catch(() => undefined);
+		void updateSharedUiState((current) => ({
+			...current,
+			panelOpen: false,
+			updatedAt: Date.now(),
+		})).catch(() => undefined);
+	}, []);
 
 	const handleTogglePictureInPicture = useCallback(() => {
 		const video = pipVideoRef.current;
@@ -1909,10 +1843,48 @@ function OverlayApp() {
 				controlsList="nodownload nofullscreen noremoteplayback"
 			/>
 			<RecorderPanelOverlay
-				onDismiss={handleRecorderPanelDismiss}
-				onOpenChange={setRecorderPanelOpen}
+				open={recorderPanelOpen}
+				onClose={closeRecorderPanel}
 			/>
-			<RecordingBarOverlay recorderPanelOpen={recorderPanelOpen} />
+			<RecordingBarOverlay
+				recorderPanelOpen={recorderPanelOpen}
+				webcam={webcam}
+				microphone={extensionSettings?.microphone ?? null}
+				onToggleWebcam={() => {
+					if (!webcam) return;
+					const nextEnabled = !webcam.enabled;
+					previewVisibilityGenerationRef.current += 1;
+					previewDismissedRef.current = !nextEnabled;
+					setRecordingPreviewActive(nextEnabled);
+					setPreviewOpen(nextEnabled);
+					if (!nextEnabled) {
+						stopLocalPreview();
+					}
+					applyWebcamSettings((current) => ({
+						...current,
+						enabled: nextEnabled,
+					}));
+				}}
+				onUpdateWebcamShape={updateShape}
+				onToggleMicrophone={() => {
+					if (!extensionSettings) return;
+					const nextEnabled = !extensionSettings.microphone.enabled;
+					setExtensionSettings((current) => {
+						if (!current) return current;
+						return {
+							...current,
+							microphone: { ...current.microphone, enabled: nextEnabled },
+						};
+					});
+					void saveSettings({
+						...extensionSettings,
+						microphone: {
+							...extensionSettings.microphone,
+							enabled: nextEnabled,
+						},
+					}).catch(() => undefined);
+				}}
+			/>
 			<CountdownOverlay />
 			<ConfirmOverlay />
 			{isDragging ? (

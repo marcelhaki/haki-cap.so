@@ -4,6 +4,7 @@ import { makeCurrentUserLayer } from "@cap/web-backend";
 import { Folder } from "@cap/web-domain";
 import { Effect } from "effect";
 import { notFound } from "next/navigation";
+import { canViewFolder } from "@/actions/folders/folder-access";
 import {
 	getChildFolders,
 	getFolderBreadcrumb,
@@ -15,7 +16,7 @@ import { runPromise } from "@/lib/server";
 
 import { CollectionShareControl } from "../../_components/CollectionShareControl";
 import { UploadCapButton } from "../../caps/components";
-import FolderCard from "../../caps/components/Folder";
+import { FoldersSection } from "../../caps/components/FoldersSection";
 import { WebRecorderDialog } from "../../caps/components/web-recorder-dialog/web-recorder-dialog";
 import {
 	BreadcrumbItem,
@@ -31,6 +32,14 @@ const FolderPage = async (props: PageProps<"/dashboard/folder/[id]">) => {
 	const user = await getCurrentUser();
 	if (!user || !user.activeOrganizationId) return notFound();
 
+	const folder = await getFolderById(folderId).pipe(
+		Effect.provide(makeCurrentUserLayer(user)),
+		Effect.catchAllCause(() => Effect.succeed(null)),
+		runPromise,
+	);
+
+	if (!folder || !(await canViewFolder(user.id, folder))) return notFound();
+
 	return Effect.gen(function* () {
 		const [childFolders, breadcrumb, videosData, share] = yield* Effect.all(
 			[
@@ -40,7 +49,6 @@ const FolderPage = async (props: PageProps<"/dashboard/folder/[id]">) => {
 					variant: "user",
 				}),
 				Effect.gen(function* () {
-					const folder = yield* getFolderById(folderId);
 					// Mirrors FoldersPolicy.canEdit for personal folders: only the
 					// creator may manage sharing; the Pro gate uses the folder's own
 					// organization, which is what the server enforces on writes.
@@ -94,29 +102,22 @@ const FolderPage = async (props: PageProps<"/dashboard/folder/[id]">) => {
 					</div>
 				</div>
 
-				{/* Display Child Folders */}
-				{childFolders.length > 0 && (
-					<>
-						<h1 className="mb-6 text-xl font-medium text-gray-12">
-							Subfolders
-						</h1>
-						<div className="grid grid-cols-[repeat(auto-fill,minmax(250px,1fr))] gap-4 mb-10">
-							{childFolders.map((folder) => (
-								<FolderCard
-									key={folder.id}
-									name={folder.name}
-									color={folder.color}
-									public={folder.public}
-									id={folder.id}
-									parentId={folder.parentId}
-									videoCount={folder.videoCount}
-									canMove={share.canManage}
-									moveRootLabel="My Caps"
-								/>
-							))}
-						</div>
-					</>
-				)}
+				<FoldersSection
+					title="Subfolders"
+					scope="personal"
+					headingSize="md"
+					folders={childFolders.map((folder) => ({
+						id: folder.id,
+						name: folder.name,
+						color: folder.color,
+						public: folder.public,
+						parentId: folder.parentId,
+						videoCount: folder.videoCount,
+						createdAt: folder.createdAt,
+					}))}
+					canMove={share.canManage}
+					moveRootLabel="My Caps"
+				/>
 
 				{/* Display Videos */}
 				<FolderVideosSection

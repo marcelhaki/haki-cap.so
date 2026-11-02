@@ -1,4 +1,9 @@
-import type { AudioCodec, MediaCodec, VideoCodec } from "mediabunny";
+import type {
+	AudioCodec,
+	InputTrack,
+	MediaCodec,
+	VideoCodec,
+} from "mediabunny";
 import type { VideoMetadata } from "./job-manager";
 import {
 	createMediaInput,
@@ -11,6 +16,7 @@ import {
 	getActiveProbeOperationCount,
 	withMediaOperation,
 } from "./media-operations";
+import { materializeMedia } from "./media-transfer";
 
 const PROBE_TIMEOUT_MS = 30_000;
 const probeFetch: typeof fetch = globalThis.fetch.bind(globalThis);
@@ -47,11 +53,12 @@ function isHttpUrl(path: string): boolean {
 
 async function hasHttpNetworkFailure(path: string): Promise<boolean> {
 	try {
-		await probeFetch(path, {
-			method: "HEAD",
+		const response = await probeFetch(path, {
+			headers: { Range: "bytes=0-0" },
 			signal: AbortSignal.timeout(10_000),
 		});
-		return false;
+		await response.body?.cancel();
+		return !response.ok;
 	} catch {
 		return true;
 	}
@@ -118,6 +125,8 @@ async function probeMedia(path: string): Promise<VideoMetadata> {
 }
 
 export async function probeVideo(videoUrl: string): Promise<VideoMetadata> {
+	const local = await materializeMedia(videoUrl);
+	if (local) return probeVideoFile(local.path);
 	if (!canAcceptNewProbeOperation()) {
 		throw new Error("Server is busy, please try again later");
 	}
@@ -134,6 +143,46 @@ export async function probeVideoFile(filePath: string): Promise<VideoMetadata> {
 
 	return await withMediaOperation("probe", () =>
 		withTimeout(probeMedia(normalizeLocalPath(filePath)), PROBE_TIMEOUT_MS),
+	);
+}
+
+export type TrackSpans = { video: number; audio: number | null };
+
+async function computeTrackSpans(path: string): Promise<TrackSpans> {
+	const input = createMediaInput(path);
+	try {
+		const videoTrack = await input.getPrimaryVideoTrack();
+		if (!videoTrack) {
+			throw new Error("No video stream found");
+		}
+		const audioTrack = await input.getPrimaryAudioTrack();
+		const span = async (track: InputTrack) => {
+			const [start, end] = await Promise.all([
+				track.getFirstTimestamp(),
+				track.computeDuration({ skipLiveWait: true }),
+			]);
+			return end - start;
+		};
+		const [video, audio] = await Promise.all([
+			span(videoTrack),
+			audioTrack ? span(audioTrack) : null,
+		]);
+		return { video, audio };
+	} finally {
+		input.dispose();
+	}
+}
+
+export async function probeTrackSpans(filePath: string): Promise<TrackSpans> {
+	if (!canAcceptNewProbeOperation()) {
+		throw new Error("Server is busy, please try again later");
+	}
+
+	return await withMediaOperation("probe", () =>
+		withTimeout(
+			computeTrackSpans(normalizeLocalPath(filePath)),
+			PROBE_TIMEOUT_MS,
+		),
 	);
 }
 

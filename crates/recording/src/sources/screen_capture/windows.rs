@@ -1,6 +1,8 @@
 use crate::{
     AudioFrame, SetupCtx, output_pipeline,
-    screen_capture::{ScreenCaptureConfig, ScreenCaptureFormat, cadence::FrameCadenceGate},
+    screen_capture::{
+        CropBounds, ScreenCaptureConfig, ScreenCaptureFormat, cadence::FrameCadenceGate,
+    },
 };
 use ::windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_SHADER_RESOURCE, D3D11_BOX, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC,
@@ -16,7 +18,7 @@ use futures::{
     channel::{mpsc, oneshot},
 };
 use scap_ffmpeg::*;
-use scap_targets::{Display, DisplayId};
+use scap_targets::{Display, DisplayId, Window, WindowId, bounds::PhysicalSize};
 use std::{
     sync::{
         Arc, Mutex,
@@ -351,13 +353,51 @@ impl output_pipeline::VideoFrame for VideoFrame {
     }
 }
 
+/// The size a window recording is encoded at: the window's own capture item,
+/// floored to even. WGC delivers the window's frames at the item's size, which
+/// differs from the window rect (invisible resize borders, odd dimensions), so
+/// sizing the output from the rect sends every frame through the CPU scaler.
+/// The odd row or column is trimmed on the GPU (`Settings::even_dimensions`),
+/// which keeps the frames exactly this size.
+pub fn window_capture_size(window: &WindowId) -> Option<PhysicalSize> {
+    let size = Window::from_id_direct(window)?
+        .raw_handle()
+        .try_as_capture_item()
+        .ok()?
+        .Size()
+        .ok()?;
+    even_capture_size(size.Width, size.Height)
+}
+
+fn even_capture_size(width: i32, height: i32) -> Option<PhysicalSize> {
+    let width = (width.max(0) as u32) & !1;
+    let height = (height.max(0) as u32) & !1;
+    (width > 0 && height > 0).then(|| PhysicalSize::new(width as f64, height as f64))
+}
+
+/// A window target captures the window's own GraphicsCaptureItem, so the crop
+/// that carves the window out of the display is neither needed nor correct:
+/// WGC already hands back just that window, and the crop would additionally
+/// pin the recording to wherever the window started out.
+fn crop_for_target(
+    window: Option<&WindowId>,
+    crop_bounds: Option<CropBounds>,
+) -> Option<CropBounds> {
+    match window {
+        Some(_) => None,
+        None => crop_bounds,
+    }
+}
+
 impl ScreenCaptureConfig<Direct3DCapture> {
     pub async fn to_sources(
         &self,
     ) -> anyhow::Result<(VideoSourceConfig, Option<SystemAudioSourceConfig>)> {
+        let crop_bounds = crop_for_target(self.config.window.as_ref(), self.config.crop_bounds);
+
         let mut settings = scap_direct3d::Settings {
             pixel_format: Direct3DCapture::PIXEL_FORMAT,
-            crop: self.config.crop_bounds.map(|b| {
+            crop: crop_bounds.map(|b| {
                 let position = b.position();
                 let size = b.size().map(|v| (v / 2.0).floor() * 2.0);
 
@@ -375,6 +415,11 @@ impl ScreenCaptureConfig<Direct3DCapture> {
                     back: 1,
                 }
             }),
+            // Matches `window_capture_size`, which the output is sized from.
+            even_dimensions: self.config.window.is_some(),
+            // Only a window target follows its item's size; display and area
+            // recordings keep the pool they were created with.
+            follow_item_size: self.config.window.is_some(),
             ..Default::default()
         };
 
@@ -393,12 +438,13 @@ impl ScreenCaptureConfig<Direct3DCapture> {
 
         settings.fps = Some(self.config.fps);
 
-        // Store the display ID instead of GraphicsCaptureItem to avoid COM threading issues
+        // Store the target's ID instead of GraphicsCaptureItem to avoid COM threading issues
         // The GraphicsCaptureItem will be created on the capture thread
         Ok((
             VideoSourceConfig {
                 video_info: self.video_info,
                 display_id: self.config.display.clone(),
+                window_id: self.config.window.clone(),
                 settings,
                 d3d_device: self.d3d_device.clone(),
             },
@@ -416,12 +462,40 @@ pub enum VideoSourceError {
 pub struct VideoSourceConfig {
     video_info: VideoInfo,
     display_id: DisplayId,
+    window_id: Option<WindowId>,
     settings: scap_direct3d::Settings,
     pub d3d_device: ID3D11Device,
 }
 pub struct VideoSource {
     video_info: VideoInfo,
     ctrl_tx: std::sync::mpsc::SyncSender<VideoControl>,
+    first_frame: Option<oneshot::Receiver<Result<(), String>>>,
+}
+
+type SharedFirstScreenFrameSender = Arc<Mutex<Option<oneshot::Sender<Result<(), String>>>>>;
+
+#[derive(Clone)]
+struct FirstScreenFrame(SharedFirstScreenFrameSender);
+
+impl FirstScreenFrame {
+    fn complete(&self, result: Result<(), String>) {
+        if let Ok(mut sender) = self.0.lock()
+            && let Some(sender) = sender.take()
+        {
+            let _ = sender.send(result);
+        }
+    }
+}
+
+async fn wait_for_first_screen_frame(
+    receiver: oneshot::Receiver<Result<(), String>>,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(timeout, receiver)
+        .await
+        .map_err(|_| anyhow!("Windows screen capture produced no accepted frame within 5s"))?
+        .map_err(|_| anyhow!("Windows screen capture closed before its first frame"))?
+        .map_err(anyhow::Error::msg)
 }
 
 enum VideoControl {
@@ -460,6 +534,7 @@ struct CaptureClosureEvent {
 
 struct CreateCapturerParams<'a> {
     display_id: &'a DisplayId,
+    window_id: Option<&'a WindowId>,
     settings: &'a scap_direct3d::Settings,
     d3d_device: &'a ID3D11Device,
     video_tx: &'a mpsc::Sender<VideoFrame>,
@@ -477,17 +552,28 @@ struct CreateCapturerParams<'a> {
     scaling_logged: Arc<AtomicBool>,
     scaled_frame_count: Arc<AtomicU32>,
     stall_health_tx: output_pipeline::HealthSender,
+    first_frame: FirstScreenFrame,
 }
 
 fn create_d3d_capturer(
     params: &CreateCapturerParams,
     error_tx: &mpsc::Sender<CaptureClosureEvent>,
 ) -> anyhow::Result<scap_direct3d::Capturer> {
-    let capture_item = Display::from_id(params.display_id)
-        .ok_or_else(|| anyhow!("Display not found for ID: {:?}", params.display_id))?
-        .raw_handle()
-        .try_as_capture_item()
-        .map_err(|e| anyhow!("Failed to create GraphicsCaptureItem: {}", e))?;
+    let capture_item = match params.window_id {
+        // Resolve the handle directly: `from_id` searches `list()`, which
+        // skips minimized windows, so a target minimized between selection
+        // and capture setup would fail to start despite still existing.
+        Some(window_id) => Window::from_id_direct(window_id)
+            .ok_or_else(|| anyhow!("Window not found for ID: {:?}", window_id))?
+            .raw_handle()
+            .try_as_capture_item()
+            .map_err(|e| anyhow!("Failed to create window GraphicsCaptureItem: {}", e))?,
+        None => Display::from_id(params.display_id)
+            .ok_or_else(|| anyhow!("Display not found for ID: {:?}", params.display_id))?
+            .raw_handle()
+            .try_as_capture_item()
+            .map_err(|e| anyhow!("Failed to create GraphicsCaptureItem: {}", e))?,
+    };
 
     scap_direct3d::Capturer::new(
         capture_item,
@@ -504,8 +590,13 @@ fn create_d3d_capturer(
             let scaling_logged = params.scaling_logged.clone();
             let scaled_frame_count = params.scaled_frame_count.clone();
             let stall_health_tx = params.stall_health_tx.clone();
+            let first_frame = params.first_frame.clone();
             move |frame| {
+                let result = (|| {
                 let capture_time = frame.inner().SystemRelativeTime()?;
+                if frame.width() == 0 || frame.height() == 0 {
+                    return Err(windows::core::Error::new(windows::Win32::Foundation::E_INVALIDARG, "Empty screen frame"));
+                }
 
                 // WGC delivers a frame per screen update — up to the monitor
                 // refresh rate on systems without MinUpdateInterval support —
@@ -518,9 +609,9 @@ fn create_d3d_capturer(
                     return Ok(());
                 }
 
-                let timestamp = Timestamp::PerformanceCounter(PerformanceCounterTimestamp::new(
-                    capture_time.Duration,
-                ));
+                let timestamp = Timestamp::PerformanceCounter(
+                    PerformanceCounterTimestamp::from_100ns(capture_time.Duration),
+                );
 
                 let frame_width = frame.width();
                 let frame_height = frame.height();
@@ -582,6 +673,7 @@ fn create_d3d_capturer(
                 ) {
                     output_pipeline::StallSendOutcome::Sent => {
                         video_frame_counter.fetch_add(1, atomic::Ordering::Relaxed);
+                        first_frame.complete(Ok(()));
                     }
                     output_pipeline::StallSendOutcome::StalledAndDropped { .. }
                     | output_pipeline::StallSendOutcome::Disconnected => {
@@ -589,9 +681,15 @@ fn create_d3d_capturer(
                     }
                 }
                 Ok(())
+                })();
+                if let Err(error) = &result {
+                    first_frame.complete(Err(format!("Windows first screen frame failed: {error}")));
+                }
+                result
             }
         },
         {
+            let first_frame = params.first_frame.clone();
             let mut err_tx = error_tx.clone();
             let device_for_callback = params.d3d_device.clone();
             move || {
@@ -603,13 +701,23 @@ fn create_d3d_capturer(
                     CaptureClosureKind::TargetLost => "capture target lost".to_string(),
                     CaptureClosureKind::Transient => "capture closed".to_string(),
                 };
+                first_frame.complete(Err(message.clone()));
                 drop(err_tx.try_send(CaptureClosureEvent { kind, message }));
                 Ok(())
             }
         },
         Some(params.d3d_device.clone()),
     )
-    .map_err(|e| anyhow!("{e}"))
+    .map_err(|error| match &error {
+        scap_direct3d::NewCapturerError::CaptureSession(inner)
+            if inner.code() == windows::Win32::Foundation::E_ACCESSDENIED =>
+        {
+            anyhow!(
+                "Windows denied Cap access to screen capture. Check that screen capture is allowed for desktop apps in Windows privacy settings and that no security software is blocking it ({error})"
+            )
+        }
+        _ => anyhow!("{error}"),
+    })
 }
 
 impl output_pipeline::VideoSource for VideoSource {
@@ -620,6 +728,7 @@ impl output_pipeline::VideoSource for VideoSource {
         VideoSourceConfig {
             video_info,
             display_id,
+            window_id,
             settings,
             d3d_device,
         }: Self::Config,
@@ -633,6 +742,8 @@ impl output_pipeline::VideoSource for VideoSource {
         let (ctrl_tx, ctrl_rx) = std::sync::mpsc::sync_channel::<VideoControl>(4);
         let monitor_ctrl_tx = ctrl_tx.clone();
 
+        let (first_tx, first_rx) = oneshot::channel();
+        let first_frame = FirstScreenFrame(Arc::new(Mutex::new(Some(first_tx))));
         let tokio_rt = tokio::runtime::Handle::current();
         let restart_counter: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
 
@@ -680,6 +791,7 @@ impl output_pipeline::VideoSource for VideoSource {
                     ($device:expr) => {
                         CreateCapturerParams {
                             display_id: &display_id,
+                            window_id: window_id.as_ref(),
                             settings: &settings,
                             d3d_device: $device,
                             video_tx: &video_tx,
@@ -693,6 +805,7 @@ impl output_pipeline::VideoSource for VideoSource {
                             scaling_logged: scaling_logged.clone(),
                             scaled_frame_count: scaled_frame_count.clone(),
                             stall_health_tx: stats_health_tx.clone(),
+                            first_frame: first_frame.clone(),
                         }
                     };
                 }
@@ -704,6 +817,9 @@ impl output_pipeline::VideoSource for VideoSource {
                     }
                     Err(e) => {
                         error!("Failed to create D3D capturer: {}", e);
+                        // `start` reads why from here: its reply channel only
+                        // says the thread is gone.
+                        first_frame.complete(Err(format!("{e:#}")));
                         return Err(e);
                     }
                 };
@@ -966,6 +1082,7 @@ impl output_pipeline::VideoSource for VideoSource {
         Ok(Self {
             video_info,
             ctrl_tx,
+            first_frame: Some(first_rx),
         })
     }
 
@@ -977,9 +1094,26 @@ impl output_pipeline::VideoSource for VideoSource {
         let (tx, rx) = oneshot::channel();
         let _ = self.ctrl_tx.send(VideoControl::Start(tx));
 
-        async {
-            rx.await??;
-            Ok(())
+        let first_frame = self.first_frame.take();
+        async move {
+            tokio::time::timeout(Duration::from_secs(5), async move {
+                let first_frame =
+                    first_frame.ok_or_else(|| anyhow!("Windows screen source already started"))?;
+                match rx.await {
+                    Ok(started) => started?,
+                    Err(_) => {
+                        return Err(match first_frame.await {
+                            Ok(Err(reason)) => anyhow!(reason),
+                            _ => anyhow!("Windows screen capture stopped before it started"),
+                        });
+                    }
+                }
+                wait_for_first_screen_frame(first_frame, Duration::from_secs(5)).await
+            })
+            .await
+            .map_err(|_| {
+                anyhow!("Windows screen startup did not acknowledge an accepted frame within 5s")
+            })?
         }
         .boxed()
     }
@@ -1118,6 +1252,8 @@ fn create_system_audio_capturer(
     let device_info = Direct3DCapture::audio_info();
     let target_info = crate::sources::audio_mixer::AudioMixer::INFO;
     let device_differs_from_target = !device_info.matches_format(&target_info);
+    let mut capture_clock =
+        crate::sources::capture_clock::CaptureClock::new(cap_timestamp::Timestamps::now());
 
     let mut resampler = if device_differs_from_target {
         info!(
@@ -1154,7 +1290,16 @@ fn create_system_audio_capturer(
                     }
                 });
 
-                let timestamp = Timestamp::from_cpal(info.timestamp().capture);
+                let buffer_duration = Duration::from_secs_f64(
+                    data.len() as f64
+                        / f64::from(config.channels.max(1))
+                        / f64::from(config.sample_rate.0.max(1)),
+                );
+                let timestamp = capture_clock.timestamp(
+                    Timestamp::from_cpal(info.timestamp().capture),
+                    std::time::Instant::now(),
+                    buffer_duration,
+                );
                 let raw_frame = data.as_ffmpeg(config);
 
                 let frame = if let Some(ref mut ctx) = resampler {
@@ -1210,7 +1355,7 @@ impl output_pipeline::AudioSource for SystemAudioSource {
     where
         Self: Sized,
     {
-        let cancel_token = CancellationToken::new();
+        let cancel_token = ctx.stop_token().child_token();
 
         ctx.tasks().spawn("system-audio", {
             let cancel = cancel_token.clone();
@@ -1249,6 +1394,7 @@ impl output_pipeline::AudioSource for SystemAudioSource {
         }));
 
         let stall_health_tx_for_watcher = ctx.health_tx().clone();
+        let runtime = tokio::runtime::Handle::current();
         ctx.tasks().spawn_thread("system-audio-watcher", {
             let state = state.clone();
             let mut watcher_tx = tx.clone();
@@ -1267,9 +1413,12 @@ impl output_pipeline::AudioSource for SystemAudioSource {
                 .ceil() as usize;
 
                 loop {
-                    std::thread::sleep(DEVICE_POLL_INTERVAL);
-
-                    if cancel.is_cancelled() {
+                    if runtime
+                        .block_on(async {
+                            tokio::time::timeout(DEVICE_POLL_INTERVAL, cancel.cancelled()).await
+                        })
+                        .is_ok()
+                    {
                         break;
                     }
 
@@ -1472,5 +1621,95 @@ impl output_pipeline::AudioSource for SystemAudioSource {
             warn!("system audio capturer pause failed: {err}");
         }
         async { Ok(()) }
+    }
+}
+
+#[cfg(test)]
+mod first_screen_frame_tests {
+    use super::*;
+
+    fn signal() -> (FirstScreenFrame, oneshot::Receiver<Result<(), String>>) {
+        let (sender, receiver) = oneshot::channel();
+        (
+            FirstScreenFrame(Arc::new(Mutex::new(Some(sender)))),
+            receiver,
+        )
+    }
+
+    #[tokio::test]
+    async fn accepted_frame_acknowledges_startup_once() {
+        let (signal, receiver) = signal();
+        signal.complete(Ok(()));
+        signal.complete(Err("later close".into()));
+        wait_for_first_screen_frame(receiver, Duration::from_millis(20))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn early_closed_source_cannot_become_ready_on_a_late_frame() {
+        let (signal, receiver) = signal();
+        signal.complete(Err("capture target lost".into()));
+        signal.complete(Ok(()));
+        let error = wait_for_first_screen_frame(receiver, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("capture target lost"));
+    }
+
+    #[tokio::test]
+    async fn no_accepted_screen_frame_is_a_startup_error() {
+        let (_signal, receiver) = signal();
+        let error = wait_for_first_screen_frame(receiver, Duration::from_millis(1))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("no accepted frame"));
+    }
+
+    #[tokio::test]
+    async fn dropped_capture_thread_is_not_startup_success() {
+        let (signal, receiver) = signal();
+        drop(signal);
+        let error = wait_for_first_screen_frame(receiver, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("closed before its first frame"));
+    }
+}
+
+#[cfg(test)]
+mod capture_target_tests {
+    use super::*;
+    use scap_targets::bounds::{PhysicalPosition, PhysicalSize};
+
+    fn bounds() -> CropBounds {
+        CropBounds::new(
+            PhysicalPosition::new(120.0, 80.0),
+            PhysicalSize::new(640.0, 480.0),
+        )
+    }
+
+    #[test]
+    fn a_display_target_keeps_its_crop() {
+        let kept = crop_for_target(None, Some(bounds())).expect("crop kept");
+        assert_eq!(kept.position().x(), 120.0);
+        assert_eq!(kept.size().width(), 640.0);
+        assert!(crop_for_target(None, None).is_none());
+    }
+
+    #[test]
+    fn a_window_recording_is_sized_to_its_capture_item_floored_to_even() {
+        let size = even_capture_size(801, 601).expect("size");
+        assert_eq!((size.width(), size.height()), (800.0, 600.0));
+        let size = even_capture_size(786, 593).expect("size");
+        assert_eq!((size.width(), size.height()), (786.0, 592.0));
+        assert!(even_capture_size(1, 600).is_none());
+        assert!(even_capture_size(-4, 600).is_none());
+    }
+
+    #[test]
+    fn a_window_target_captures_the_window_rather_than_a_crop_of_the_display() {
+        let window: WindowId = "1234".parse().unwrap();
+        assert!(crop_for_target(Some(&window), Some(bounds())).is_none());
     }
 }

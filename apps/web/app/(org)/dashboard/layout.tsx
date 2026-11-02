@@ -1,12 +1,14 @@
 import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
 import { organizationInvites } from "@cap/database/schema";
+import { userIsPro } from "@cap/utils";
 import { and, eq } from "drizzle-orm";
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { AuthContextProvider } from "@/app/Layout/AuthContext";
 import { resolveCurrentUser } from "@/app/Layout/current-user";
 import { runPromise } from "@/lib/server";
+import { getShareableLinkUsage } from "@/lib/shareable-link-quota";
 import DashboardInner from "./_components/DashboardInner";
 import { DashboardPasteImport } from "./_components/DashboardPasteImport";
 import MobileTab from "./_components/MobileTab";
@@ -47,10 +49,22 @@ export default async function DashboardLayout({
 	const user = await getCurrentUser();
 	if (!user) redirect("/login");
 
-	const pendingInviteId = await getPendingInviteIdForUser(user.email);
+	const hasName = Boolean(user.name && user.name.length > 0);
+	const pendingInviteIdPromise = getPendingInviteIdForUser(user.email);
+	const dashboardDataPromise = hasName ? getDashboardData(user) : null;
+	// Fail-open: the meter is informational and must never take the shell down.
+	const shareableLinkUsagePromise =
+		hasName && !userIsPro(user)
+			? getShareableLinkUsage(user.id).catch((error) => {
+					console.error("Failed to load shareable link usage", error);
+					return null;
+				})
+			: null;
+
+	const pendingInviteId = await pendingInviteIdPromise;
 	if (pendingInviteId) redirect(`/invite/${pendingInviteId}`);
 
-	if (!user.name || user.name.length === 0) {
+	if (!hasName || !dashboardDataPromise) {
 		redirect("/onboarding/welcome");
 	}
 
@@ -61,7 +75,7 @@ export default async function DashboardLayout({
 	let anyNewNotifications = false;
 	let userPreferences: UserPreferences;
 	try {
-		const dashboardData = await getDashboardData(user);
+		const dashboardData = await dashboardDataPromise;
 		organizationSelect = dashboardData.organizationSelect;
 		userCapsCount = dashboardData.userCapsCount;
 		organizationSettings = dashboardData.organizationSettings;
@@ -77,6 +91,8 @@ export default async function DashboardLayout({
 		anyNewNotifications = false;
 		userPreferences = null;
 	}
+
+	const shareableLinkUsage = await shareableLinkUsagePromise;
 
 	let activeOrganization = organizationSelect.find(
 		(organization) =>
@@ -105,6 +121,7 @@ export default async function DashboardLayout({
 					anyNewNotifications={anyNewNotifications}
 					userPreferences={userPreferences}
 					referClicked={referClicked === "true"}
+					shareableLinkUsage={shareableLinkUsage}
 				>
 					<DashboardPasteImport />
 					<div className="bg-gray-2 dashboard-grid">
