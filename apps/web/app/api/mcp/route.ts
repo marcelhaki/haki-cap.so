@@ -27,6 +27,21 @@ const allowedOrigins = () =>
 		"https://grok.com",
 	]);
 
+// Behind a proxy (Railway, Docker) request.url carries the container's own address, so use the
+// host and protocol the proxy forwards, as share links and playlists already do.
+const requestOrigin = (request: Request) => {
+	const url = new URL(request.url);
+	const first = (value: string | null) => value?.split(",")[0]?.trim() || null;
+	const host =
+		first(request.headers.get("x-forwarded-host")) ??
+		first(request.headers.get("host")) ??
+		url.host;
+	const protocol =
+		first(request.headers.get("x-forwarded-proto")) ??
+		url.protocol.slice(0, -1);
+	return `${protocol}://${host}`;
+};
+
 const corsHeaders = (request: Request) => {
 	const origin = request.headers.get("origin");
 	if (!origin || !allowedOrigins().has(origin)) return new Headers();
@@ -73,7 +88,7 @@ async function handlePost(request: Request) {
 	const origin = request.headers.get("origin");
 	if (origin && !allowedOrigins().has(origin))
 		return new Response(null, { status: 403 });
-	if (new URL(request.url).origin !== mcpIssuer())
+	if (requestOrigin(request) !== mcpIssuer())
 		return new Response(null, { status: 421 });
 	const authorization = request.headers.get("authorization");
 	const principal = await authenticateMcpBearer(authorization);

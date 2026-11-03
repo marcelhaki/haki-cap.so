@@ -129,6 +129,24 @@ describe("hosted MCP transport", () => {
 		expect((await POST(oversized)).status).toBe(413);
 	});
 
+	it("accepts requests a proxy forwards for the public host and refuses other hosts", async () => {
+		const payload = { jsonrpc: "2.0", id: 1, method: "initialize" };
+		const proxied = (host: string) =>
+			new Request("http://localhost:8080/api/mcp", {
+				method: "POST",
+				headers: {
+					Authorization: "Bearer valid",
+					"Content-Type": "application/json",
+					Accept: "application/json, text/event-stream",
+					"X-Forwarded-Host": host,
+					"X-Forwarded-Proto": "https",
+				},
+				body: JSON.stringify(payload),
+			});
+		expect((await POST(proxied("cap.so"))).status).toBe(200);
+		expect((await POST(proxied("elsewhere.example"))).status).toBe(421);
+	});
+
 	it("initializes, lists three read-only tools, and reads a recording", async () => {
 		const initialized = await POST(
 			request({
