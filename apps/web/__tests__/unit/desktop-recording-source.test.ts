@@ -3050,3 +3050,143 @@ describe("decoding prepared fragments during the recording", () => {
 		expect(await buildPreverifiedRunUrls(recording())).toEqual([]);
 	});
 });
+
+describe("copies that reach storage twice", () => {
+	const preconditionFailed = () =>
+		Object.assign(
+			new Error(
+				"At least one of the pre-conditions you specified did not hold",
+			),
+			{ name: "PreconditionFailed", $metadata: { httpStatusCode: 412 } },
+		);
+
+	// The first delivery writes the copy; the replay of the same request is refused by If-None-Match.
+	function replayCopies(
+		storage: ReturnType<typeof storageFixture>,
+		count: number,
+	) {
+		const copy = storage.bucket.copyObject.getMockImplementation();
+		if (!copy) throw new Error("Missing copy implementation");
+		const replayed: string[] = [];
+		storage.bucket.copyObject.mockImplementation((source, key, options) => {
+			if (replayed.length >= count) return copy(source, key, options);
+			replayed.push(key);
+			return copy(source, key, options).pipe(
+				Effect.flatMap(() => Effect.fail(preconditionFailed())),
+			);
+		});
+		return replayed;
+	}
+
+	const copyKeys = (storage: ReturnType<typeof storageFixture>) =>
+		[...storage.objects.keys()].filter(
+			(key) => key.includes("/copies/") && /\.(mp4|m4s)$/.test(key),
+		);
+
+	it.each([
+		["Cap's listed bucket", () => listedStorage()],
+		["per-object checks", () => storageFixture()],
+	])(
+		"keeps a copy whose request was replayed on %s",
+		async (_, makeStorage) => {
+			const storage = makeStorage();
+			seedRecording(storage, 6, 2);
+			const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+			const replayed = replayCopies(storage, 3);
+			const source = await commitDesktopRecordingSource(
+				recording(),
+				generation,
+			);
+			const committed = readInventory(storage, source.inventoryKey).objects.map(
+				(entry) => entry.key,
+			);
+			expect(replayed).toHaveLength(3);
+			for (const key of replayed) expect(committed).toContain(key);
+			expect(
+				inventoryShape(storage, source.inventoryKey).every(
+					(entry) => entry.identityMatchesCopy,
+				),
+			).toBe(true);
+			expect(
+				warn.mock.calls.filter(([line]) =>
+					String(line).includes("desktop_source_copy_replay_recovered"),
+				),
+			).toHaveLength(3);
+			warn.mockRestore();
+			// No abandoned copies: every fragment copy written belongs to the committed snapshot.
+			expect(copyKeys(storage).every((key) => committed.includes(key))).toBe(
+				true,
+			);
+		},
+	);
+
+	it("still refuses the snapshot when the original changed", async () => {
+		const storage = listedStorage();
+		const { segmentKey } = seedRecording(storage, 4, 0);
+		const changed = segmentKey("video", 2);
+		const copy = storage.bucket.copyObject.getMockImplementation();
+		if (!copy) throw new Error("Missing copy implementation");
+		storage.bucket.copyObject.mockImplementation((source, key, options) => {
+			if (!source.endsWith(changed)) return copy(source, key, options);
+			storage.object(changed).identity = '"rewritten-after-listing"';
+			return Effect.fail(preconditionFailed());
+		});
+		await expect(
+			commitDesktopRecordingSource(recording(), generation),
+		).rejects.toMatchObject({ code: "source-changed" });
+		expect(
+			storage.bucket.putObject.mock.calls.some(([key]) =>
+				key.endsWith("/inventory.json"),
+			),
+		).toBe(false);
+	});
+
+	it("still refuses the snapshot when the original changed after its copy landed", async () => {
+		const storage = listedStorage();
+		const { segmentKey } = seedRecording(storage, 4, 0);
+		const changed = segmentKey("video", 2);
+		const copy = storage.bucket.copyObject.getMockImplementation();
+		if (!copy) throw new Error("Missing copy implementation");
+		storage.bucket.copyObject.mockImplementation((source, key, options) =>
+			source.endsWith(changed)
+				? copy(source, key, options).pipe(
+						Effect.flatMap(() =>
+							Effect.sync(() => {
+								storage.object(changed).identity = '"rewritten-after-copy"';
+							}),
+						),
+						Effect.flatMap(() => Effect.fail(preconditionFailed())),
+					)
+				: copy(source, key, options),
+		);
+		await expect(
+			commitDesktopRecordingSource(recording(), generation),
+		).rejects.toMatchObject({ code: "source-changed" });
+		expect(
+			storage.bucket.putObject.mock.calls.some(([key]) =>
+				key.endsWith("/inventory.json"),
+			),
+		).toBe(false);
+	});
+
+	it("does not keep a wrong object found at the copy key", async () => {
+		const storage = listedStorage();
+		const { segmentKey } = seedRecording(storage, 4, 0);
+		const target = segmentKey("video", 3);
+		const copy = storage.bucket.copyObject.getMockImplementation();
+		if (!copy) throw new Error("Missing copy implementation");
+		storage.bucket.copyObject.mockImplementation((source, key, options) => {
+			if (!source.endsWith(target)) return copy(source, key, options);
+			storage.seed(key, "not-the-original-fragment");
+			return Effect.fail(preconditionFailed());
+		});
+		await expect(
+			commitDesktopRecordingSource(recording(), generation),
+		).rejects.toMatchObject({ code: "source-changed" });
+		expect(
+			storage.bucket.putObject.mock.calls.some(([key]) =>
+				key.endsWith("/inventory.json"),
+			),
+		).toBe(false);
+	});
+});

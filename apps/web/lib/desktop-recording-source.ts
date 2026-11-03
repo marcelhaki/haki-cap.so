@@ -864,6 +864,33 @@ async function checkCopy(
 	return { ...original, key, objectIdentity: identity };
 }
 
+// Copy keys hold a fresh UUID, so a 412 can also mean the same request reached storage twice and
+// the first delivery already wrote the copy (seen on Tigris under parallel copies). Keep that copy
+// when it passes the checks every copy passes; anything else keeps the caller's handling.
+async function existingCopyAfterConflict(
+	context: SourceContext,
+	original: OriginalObject,
+	key: string,
+	error: unknown,
+): Promise<SourceObject | null> {
+	const classified = sourceStorageError(error);
+	if (
+		!(classified instanceof DesktopRecordingSourceError) ||
+		classified.code !== "source-changed"
+	)
+		return null;
+	const copy = await checkCopy(context, original, key).catch(() => null);
+	if (copy)
+		console.warn(
+			JSON.stringify({
+				event: "desktop_source_copy_replay_recovered",
+				videoId: context.video.id,
+				key,
+			}),
+		);
+	return copy;
+}
+
 function objectDirectory(key: string) {
 	return key.slice(0, key.lastIndexOf("/", key.lastIndexOf("/") - 1));
 }
@@ -985,6 +1012,13 @@ async function copySmallObject(
 			),
 		);
 	} catch (error) {
+		const existing = await existingCopyAfterConflict(
+			context,
+			original,
+			key,
+			error,
+		);
+		if (existing) return saveObjectReceipt(context, existing);
 		await checkOriginal(context, original);
 		throw error;
 	}
@@ -1017,6 +1051,13 @@ async function copyListedObject(
 			),
 		);
 	} catch (error) {
+		const existing = await existingCopyAfterConflict(
+			context,
+			original,
+			key,
+			error,
+		);
+		if (existing) return saveObjectReceipt(context, existing);
 		await checkOriginal(context, original);
 		throw error;
 	}
